@@ -67,7 +67,7 @@ export class Parser {
 		for (const [key, value] of Object.entries(structure.header)) {
 			header[key as keyof typeof structure.header] = this.read(this.cast(value));
 		}
-		console.log(header);
+		//console.log(header);
         
 		this.align();
 

@@ -66,11 +66,12 @@ export class Decompiler {
 		const labels = this.labels(insts);
 		const blocks = this.blocks(insts, labels);
 		const flow = this.blockFlow(blocks);
-		console.log(flow);
+		//console.log(flow);
 		
 		this.markDataFlow(flow, new Set());
+		this.inlineCalls();
 
-		console.log(Array.from(this.nodeMap.values()));
+		//console.log(Array.from(this.nodeMap.values()));
 
 
 		for (const val of this.nodeMap.values()) {
@@ -80,7 +81,8 @@ export class Decompiler {
 		}
 		
 
-		this.convertBlock(flow, this.nodeMap, new Map(), new Set());
+		const stmts = this.convertBlock(flow, this.nodeMap, new Map(), new Map());
+		this.debugBlock(stmts);
 
 		// for (const [instr, node] of nodes) {
 		// 	if (node.affects.length == 0) {
@@ -91,11 +93,13 @@ export class Decompiler {
 		// }
 	}
 
-	private convertBlock(block: Block, nodeMap: Map<Instruction, InstructionNode>, converted: Map<InstructionNode, ts.Expression>, visited: Set<Block>) {
+	private convertBlock(block: Block, nodeMap: Map<Instruction, InstructionNode>, converted: Map<InstructionNode, ts.Expression>, visited: Map<Block, ts.Statement[]>, until?: Block) {
 		if (visited.has(block)) {
-			return;
+			return visited.get(block) as ts.Statement[];
 		}
-		visited.add(block);
+
+		let stmts: ts.Statement[] = [];		
+		visited.set(block, stmts);
 
 		for (const instr of block.insts) {
 			const node = nodeMap.get(instr);
@@ -103,14 +107,66 @@ export class Decompiler {
 				throw new Error('Instruction not in node dictionary');
 			}
 			if (node.affects.length == 0) {
-				this.emit(node, converted);
-			} else if (node.affects.length > 1) {
-				this.save(node, converted);
+				const expr = this.emit(node, converted);
+
+				if (node.instr.opcode === 'Jmp') {
+					if (until != block.tLabel) {
+						stmts.push(...this.convertBlock(block.tLabel, nodeMap, converted, visited, until));
+					}
+					return stmts;
+				}
+
+				if (node.instr.opcode.startsWith('J')) {
+					if (node.instr.operands[0].value < 0) {
+						stmts = [
+							ts.factory.createDoStatement(
+								ts.factory.createBlock(this.convertBlock(block.tLabel, nodeMap, converted, visited, block)),
+								expr
+							)
+						];
+						visited.set(block, stmts);
+					} else if (node.instr.opcode.startsWith('JNot')) {
+						const jmp = this.endsInJmp(block.fLabel, new Set(), block.tLabel.insts[0].ip);
+						if (jmp) {
+							stmts.push(ts.factory.createIfStatement(expr, 
+								ts.factory.createBlock(this.convertBlock(block.fLabel, nodeMap, converted, visited, jmp.tLabel)),
+								ts.factory.createBlock(this.convertBlock(block.tLabel, nodeMap, converted, visited, jmp.tLabel))));
+							stmts.push(...this.convertBlock(jmp.tLabel, nodeMap, converted, visited, until));
+						} else {
+							stmts.push(ts.factory.createIfStatement(expr, 
+								ts.factory.createBlock(this.convertBlock(block.fLabel, nodeMap, converted, visited, block.tLabel))));
+							stmts.push(...this.convertBlock(block.tLabel, nodeMap, converted, visited, until));
+						}
+					} else {
+						const jmp = this.endsInJmp(block.fLabel, new Set(), block.tLabel.insts[0].ip);
+						if (jmp) {
+							stmts.push(ts.factory.createIfStatement(expr, 
+								ts.factory.createBlock(this.convertBlock(block.tLabel, nodeMap, converted, visited, jmp.tLabel)),
+								ts.factory.createBlock(this.convertBlock(block.fLabel, nodeMap, converted, visited, jmp.tLabel))));
+							stmts.push(...this.convertBlock(jmp.tLabel, nodeMap, converted, visited, until));
+						} else {
+							stmts.push(ts.factory.createIfStatement(ts.factory.createLogicalNot(expr),
+								ts.factory.createBlock(this.convertBlock(block.fLabel, nodeMap, converted, visited, block.tLabel))));
+							stmts.push(...this.convertBlock(block.tLabel, nodeMap, converted, visited, until));
+						}
+					}
+				} else {
+					stmts.push(ts.factory.createExpressionStatement(expr));
+				}
+			} else if (node.affects.length > 1 
+				|| (node.affects[0].dependsOn.find(d => d?.includes(node))?.length ?? 0) > 1) {
+				const stmt = this.save(node, converted);
+				if (stmt) {
+					stmts.push(stmt);
+				}
 			}
 		}
 
-		this.convertBlock(block.fLabel, nodeMap, converted, visited);
-		this.convertBlock(block.tLabel, nodeMap, converted, visited);
+		if (!block.insts[block.insts.length - 1].opcode.startsWith('J') && until != block.fLabel) {
+			stmts.push(...this.convertBlock(block.fLabel, nodeMap, converted, visited, until));
+		}
+
+		return stmts;
 	}
 
 	private emit(node: InstructionNode, converted: Map<InstructionNode, ts.Expression>) {
@@ -118,18 +174,20 @@ export class Decompiler {
 		converted.set(node, r);
 
 		if (node.instr.opcode !== 'Jmp' && node.instr.opcode.startsWith('J')) {
-			const stmt = ts.factory.createIfStatement(r, ts.factory.createEmptyStatement());
-			this.debug(stmt);
+			//const stmt = ts.factory.createIfStatement(r, ts.factory.createEmptyStatement());
+			//this.debug(stmt);
 			//console.log('emit', node, r);
 		} else {
-			const stmt = ts.factory.createExpressionStatement(r);
-			this.debug(stmt);
+			//const stmt = ts.factory.createExpressionStatement(r);
+			//this.debug(stmt);
 			//console.log('emit', node, r);
 		}
+
+		return r;
 	}
 
 	private static varId = 1;
-	private save(node: InstructionNode, converted: Map<InstructionNode, ts.Expression>) {
+	private save(node: InstructionNode, converted: Map<InstructionNode, ts.Expression>): ts.Statement | undefined {
 		const name = 'v' + Decompiler.varId;
 		const id = ts.factory.createUniqueName(name);
 		Decompiler.varId++;
@@ -138,6 +196,8 @@ export class Decompiler {
 
 		if (ts.isIdentifier(r) && r.text === 'globalThis') {
 			converted.set(node, r);
+			return;
+
 		} else if (node.affects.includes(node)) {
 			const register = node.instr.operands.find(o => o.kind === SourceSinkType.SOURCE)?.value as number;
 			const sourceIndex = node.instr.operands.findIndex(o => o.kind === SourceSinkType.SINK && o.value === register);
@@ -145,16 +205,61 @@ export class Decompiler {
 			converted.set(node, target ?? id);
 			
 			const stmt = ts.factory.createExpressionStatement(ts.factory.createAssignment(target, r));
-			this.debug(stmt);
+			//this.debug(stmt);
+
+			return stmt;
+
+		} else if ((node.affects[0].dependsOn.find(d => d?.includes(node))?.length ?? 0) > 1) {
+			const deps = node.affects[0].dependsOn.find(d => d?.includes(node)) ?? [];
+			const dep = deps.find(d => converted.has(d));
+			const target = converted.get(dep ?? node);
+
+			if (target) {
+				converted.set(node, target);
+				const stmt = ts.factory.createExpressionStatement(ts.factory.createAssignment(target, r));
+				return stmt;
+			} else {
+				converted.set(node, id);
+				const v = ts.factory.createVariableDeclaration(id, undefined, undefined, r);
+				const stmt = ts.factory.createVariableStatement(undefined, [v]);
+				return stmt;
+			}
+			
+			//this.debug(stmt);
 
 		} else {
 			converted.set(node, id);
 			const v = ts.factory.createVariableDeclaration(id, undefined, undefined, r);
 			const stmt = ts.factory.createVariableStatement(undefined, [v]);
-			this.debug(stmt);
+			//this.debug(stmt);
 			//console.log('save', node, v);
+
+			return stmt;
+		}
+	}
+
+	private endsInJmp(block: Block, visited: Set<Block>, ip: number): Block | undefined {
+		if (visited.has(block)) {
+			return;
+		}
+		visited.add(block);
+
+		if (block.insts[block.insts.length - 1].opcode === 'Jmp' && block.fLabel.insts[0].ip === ip) {
+			return block;
 		}
 
+		if (block.insts.some(i => i.opcode === 'Ret')) {
+			return;
+		}
+
+		const resultT = this.endsInJmp(block.tLabel, visited, ip);
+		if (resultT) {
+			return resultT;
+		}
+
+		if (block.insts[block.insts.length - 1].opcode === 'Jmp') {
+			return this.endsInJmp(block.fLabel, visited, ip);
+		}
 	}
 
 	private convertInstruction(node: InstructionNode, converted: Map<InstructionNode, ts.Expression>) : ts.Expression {
@@ -191,6 +296,12 @@ export class Decompiler {
 		case 'GetByIdShort':
 			return ts.factory.createPropertyAccessExpression(this.convertInstruction(node.dependsOn[1][0], converted), node.instr.operands[3].value as string);
 		case 'Call2':
+			if (node.dependsOn[2]) {
+				return ts.factory.createCallExpression(
+					ts.factory.createPropertyAccessExpression(this.convertInstruction(node.dependsOn[1][0], converted), 'call'), 
+					undefined, 
+					[this.convertInstruction(node.dependsOn[2][0], converted), this.convertInstruction(node.dependsOn[3][0], converted)]);
+			}
 			return ts.factory.createCallExpression(this.convertInstruction(node.dependsOn[1][0], converted), undefined, [this.convertInstruction(node.dependsOn[3][0], converted)]);
 		case 'AddN':
 			return ts.factory.createAdd(this.convertInstruction(node.dependsOn[1][0], converted), this.convertInstruction(node.dependsOn[2][0], converted));
@@ -363,6 +474,19 @@ export class Decompiler {
 		return blockMap[0];
 	}
 
+	private inlineCalls() {
+		for (const node of this.nodeMap.values()) {
+			if (node.instr.opcode === 'Call2'
+			&& node.dependsOn[2].length === 1
+			&& node.dependsOn[2][0].affects.length === 2
+			&& node.dependsOn[2][0].affects[0] === node.dependsOn[1][0]
+			&& node.dependsOn[2][0].affects[1] === node) {
+				node.dependsOn[2][0].affects.pop();
+				delete node.dependsOn[2];
+			}
+		}
+	}
+
 	private debug(stmt: ts.Statement) {
 		const src = ts.createSourceFile('x.ts', '', ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
 
@@ -370,6 +494,15 @@ export class Decompiler {
 		
 		const printer = ts.createPrinter();
 		const result = printer.printNode(ts.EmitHint.Unspecified, stmt, src);
+		console.log(result);
+	}
+	private debugBlock(stmts: ts.Statement[]) {
+		const src = ts.createSourceFile('x.ts', '', ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
+
+		ts.factory.updateSourceFile(src, stmts);
+		
+		const printer = ts.createPrinter();
+		const result = printer.printNode(ts.EmitHint.Unspecified, ts.factory.createBlock(stmts, true), src);
 		console.log(result);
 	}
 }
