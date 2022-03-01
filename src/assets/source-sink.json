@@ -1,0 +1,72 @@
+{
+    "LoadConstString": [
+        "source",
+        "const"
+    ],
+    "GetGlobalObject": [
+        "source"
+    ],
+    "LoadConstUInt8": [
+        "source",
+        "const"
+    ],
+    "TryGetById": [
+        "source",
+        "sink",
+        "const",
+        "const"
+    ],
+    "LoadConstZero": [
+        "source"
+    ],
+    "JNotLess": [
+        "conditional",
+        "sink",
+        "sink"
+    ],
+    "JLess": [
+        "conditional",
+        "sink",
+        "sink"
+    ],
+    "JEqual": [
+        "conditional",
+        "sink",
+        "sink"
+    ],
+    "JNotEqual": [
+        "conditional",
+        "sink",
+        "sink"
+    ],
+    "GetByIdShort": [
+        "source",
+        "sink",
+        "const",
+        "const"
+    ],
+    "Call2": [
+        "source",
+        "sink",
+        "sink",
+        "sink"
+    ],
+    "AddN": [
+        "source",
+        "sink",
+        "sink"
+    ],
+    "Jmp": [
+        "unconditional"
+    ],
+    "Mov": [
+        "source",
+        "sink"
+    ],
+    "LoadConstUndefined": [
+        "source"
+    ],
+    "Ret": [
+        "sink"
+    ]
+}
