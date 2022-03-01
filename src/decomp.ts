@@ -82,7 +82,10 @@ export class Decompiler {
 		
 
 		const stmts = this.convertBlock(flow, this.nodeMap, new Map(), new Map());
-		this.debugBlock(stmts);
+		const block = ts.factory.createBlock(stmts);
+		const blockWhile = this.combineIfDoWhile(block);
+		const blockFor = this.combindeFor(blockWhile);
+		this.debugBlock(blockFor);
 
 		// for (const [instr, node] of nodes) {
 		// 	if (node.affects.length == 0) {
@@ -186,11 +189,8 @@ export class Decompiler {
 		return r;
 	}
 
-	private static varId = 1;
 	private save(node: InstructionNode, converted: Map<InstructionNode, ts.Expression>): ts.Statement | undefined {
-		const name = 'v' + Decompiler.varId;
-		const id = ts.factory.createUniqueName(name);
-		Decompiler.varId++;
+		const id = ts.factory.createUniqueName('l');
 		
 		const r = this.convertInstruction(node, converted);
 
@@ -487,6 +487,86 @@ export class Decompiler {
 		}
 	}
 
+	private combineIfDoWhile<T extends ts.Node>(node: T) {
+		const test= ts.transform(node, [(context: ts.TransformationContext) => (node) => 
+			ts.visitNode(node, function visit(node): ts.Node {
+				if (ts.isIfStatement(node)
+				&& ts.isBlock(node.thenStatement)
+				&& node.thenStatement.statements.length === 1
+				&& ts.isDoStatement(node.thenStatement.statements[0])
+				&& !node.elseStatement
+				&& JSON.stringify(node.expression) === JSON.stringify(node.thenStatement.statements[0].expression)) {
+					return ts.factory.createWhileStatement(node.expression, node.thenStatement.statements[0].statement);
+				}
+				return ts.visitEachChild(node, visit, context);
+			} as ts.Visitor)
+		]);
+		return test.transformed[0];
+	}
+
+	private combindeFor<T extends ts.Node>(node: T) {
+		const test= ts.transform(node, [(context: ts.TransformationContext) => (node) => 
+			ts.visitNode(node, (function visit(this: Decompiler, node): ts.Node {
+				if (ts.isBlock(node)) {
+					const stmt = Array.from(node.statements);
+					for (let i = 1; i < stmt.length; i++) {
+						const current = stmt[i];
+						const last = stmt[i - 1];
+	
+						if (ts.isWhileStatement(current)
+						&& ts.isBlock(current.statement)
+						&& ts.isVariableStatement(last)
+						&& last.declarationList.declarations.length === 1
+						&& last.declarationList.declarations[0].initializer
+						&& ts.isNumericLiteral(last.declarationList.declarations[0].initializer)) {
+							const end = current.statement.statements[current.statement.statements.length-1];
+							if (ts.isExpressionStatement(end)
+							&& ts.isBinaryExpression(end.expression)
+							&& end.expression.operatorToken.kind === ts.SyntaxKind.FirstAssignment
+							&& ts.isIdentifier(end.expression.left)
+							&& ts.isBinaryExpression(end.expression.right)
+							&& end.expression.right.operatorToken.kind === ts.SyntaxKind.PlusToken
+							&& ts.isIdentifier(end.expression.right.left)
+							&& end.expression.left === end.expression.right.left
+							&& ts.isNumericLiteral(end.expression.right.right)) {
+
+								const inner = ts.factory.createBlock(current.statement.statements.slice(0, current.statement.statements.length-1));
+
+								const increment = end.expression.right.right.text === '1'
+									? ts.factory.createPostfixIncrement(end.expression.left)
+									: end.expression;
+
+								const loop = ts.factory.createForStatement(last.declarationList, current.expression, increment, inner);
+								const renamed = this.rename(loop, end.expression.left, ts.factory.createUniqueName('i', ts.GeneratedIdentifierFlags.Optimistic));
+
+								stmt[i] = renamed;
+								stmt.splice(i-1, 1);
+								i--;
+							}
+						}
+					}
+					node = ts.factory.createBlock(stmt);
+				}
+
+				return ts.visitEachChild(node, visit.bind(this), context);
+			} as ts.Visitor).bind(this))
+		]);
+		return test.transformed[0];
+	}
+
+	private rename<T extends ts.Node>(node: T, oldName: ts.Identifier, newName: ts.Identifier) {
+		const test= ts.transform(node, [(context: ts.TransformationContext) => (node) => 
+			ts.visitNode(node, function visit(node): ts.Node {
+				if (node === oldName) {
+					return newName;
+				}
+
+				return ts.visitEachChild(node, visit, context);
+			} as ts.Visitor)
+		]);
+		return test.transformed[0];
+	}
+
 	private debug(stmt: ts.Statement) {
 		const src = ts.createSourceFile('x.ts', '', ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
 
@@ -496,13 +576,13 @@ export class Decompiler {
 		const result = printer.printNode(ts.EmitHint.Unspecified, stmt, src);
 		console.log(result);
 	}
-	private debugBlock(stmts: ts.Statement[]) {
+	private debugBlock(stmts: ts.Block) {
 		const src = ts.createSourceFile('x.ts', '', ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
 
-		ts.factory.updateSourceFile(src, stmts);
+		ts.factory.updateSourceFile(src, stmts.statements);
 		
 		const printer = ts.createPrinter();
-		const result = printer.printNode(ts.EmitHint.Unspecified, ts.factory.createBlock(stmts, true), src);
+		const result = printer.printNode(ts.EmitHint.Unspecified, stmts, src);
 		console.log(result);
 	}
 }
