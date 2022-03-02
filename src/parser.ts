@@ -11,6 +11,7 @@ export interface FunctionHeader {
     infoOffset: number;
     bytecodeSizeInBytes: number;
     functionName: number;
+	paramCount: number;
     [key: string]: unknown;
 }
 

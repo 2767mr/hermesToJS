@@ -90,6 +90,12 @@ export class Disassembler {
 		return insts;
 	}
 
+
+	public getName(func: FunctionHeader) {
+		return this.getString(func.functionName);
+	}
+
+
 	private getString(sid: number) {
 		if (sid < 0 || sid > this.header.header.stringCount) {
 			//debugger;

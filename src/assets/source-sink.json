@@ -51,6 +51,14 @@
         "sink",
         "sink"
     ],
+    "Call4": [
+        "source",
+        "sink",
+        "sink",
+        "sink",
+        "sink",
+        "sink"
+    ],
     "AddN": [
         "source",
         "sink",
@@ -67,6 +75,50 @@
         "source"
     ],
     "Ret": [
+        "sink"
+    ],
+    "DeclareGlobalVar": [],
+    "CreateEnvironment": [
+        "source"
+    ],
+    "CreateClosure": [
+        "source",
+        "sink",
+        "const"
+    ],
+    "PutById": [
+        "sink",
+        "sink",
+        "const",
+        "const"
+    ],
+    "LoadParam": [
+        "source",
+        "const"
+    ],
+    "CallBuiltin": [
+        "source",
+        "const",
+        "const"
+    ],
+    "Add": [
+        "source",
+        "sink",
+        "sink"
+    ],
+    "Sub": [
+        "source",
+        "sink",
+        "sink"
+    ],
+    "Mul": [
+        "source",
+        "sink",
+        "sink"
+    ],
+    "Div": [
+        "source",
+        "sink",
         "sink"
     ]
 }

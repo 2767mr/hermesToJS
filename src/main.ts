@@ -3,7 +3,7 @@ import { Decompiler } from './decomp';
 import { Disassembler } from './disasm';
 import { Parser } from './parser';
 
-const data = fs.readFileSync('../hermes/test.bundle');
+const data = fs.readFileSync('../hermes/functions.bundle');
 const parser = new Parser(data);
 const header = parser.parse();
 
