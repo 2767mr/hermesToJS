@@ -16,8 +16,18 @@
         "const",
         "const"
     ],
+    "GetById": [
+        "source",
+        "sink",
+        "const",
+        "const"
+    ],
     "LoadConstZero": [
         "source"
+    ],
+    "JmpTrue": [
+        "conditional",
+        "sink"
     ],
     "JNotLess": [
         "conditional",
@@ -39,11 +49,26 @@
         "sink",
         "sink"
     ],
+    "JStrictEqual": [
+        "conditional",
+        "sink",
+        "sink"
+    ],
+    "JStrictNotEqual": [
+        "conditional",
+        "sink",
+        "sink"
+    ],
     "GetByIdShort": [
         "source",
         "sink",
         "const",
         "const"
+    ],
+    "Call1": [
+        "source",
+        "sink",
+        "sink"
     ],
     "Call2": [
         "source",
@@ -74,7 +99,17 @@
     "LoadConstUndefined": [
         "source"
     ],
+    "LoadConstFalse": [
+        "source"
+    ],
+    "NewObject": [
+        "source"
+    ],
     "Ret": [
+        "sink"
+    ],
+    "TypeOf": [
+        "source",
         "sink"
     ],
     "DeclareGlobalVar": [],
@@ -120,5 +155,22 @@
         "source",
         "sink",
         "sink"
+    ],
+    "StoreToEnvironment": [
+        "sink",
+        "const",
+        "sink"
+    ],
+    "LoadFromEnvironment": [
+        "source",
+        "sink",
+        "const"
+    ],
+    "GetEnvironment": [
+        "source",
+        "const"
+    ],
+    "LoadThisNS": [
+        "source"
     ]
 }

@@ -34,7 +34,7 @@ interface Context {
 	nodeConversion: Map<InstructionNode, ts.Expression>;
 	nodeConverted: Set<InstructionNode>;
 	blocksConversion: Map<Block, ts.Statement[]>;
-	fixups: Map<ts.Statement, () => ts.Statement[]>;
+	fixups: Map<ts.Node, () => ts.Statement[]>;
 	environments: Map<ts.Expression, Environment>;
 	params: ts.Identifier[];
 }
@@ -57,7 +57,8 @@ export class Decompiler {
 			environments: new Map(),
 			params: [ts.factory.createUniqueName('p')]
 		};
-		this.decompileFuction(this.header.functionHeaders[0], context);
+		const result = this.decompileFuction(this.header.functionHeaders[0], context);
+		this.debugBlock(result);
 	}
 	private asRegister(operand: string | number) {
 		if (typeof operand !== 'string' || !operand.startsWith('Reg8:')) {
@@ -106,10 +107,10 @@ export class Decompiler {
 		
 
 		const stmts = this.convertBlock(flow, context);
-		const block = ts.factory.createBlock(stmts);
-		const blockWhile = this.combineIfDoWhile(block);
+		const block = ts.factory.createBlock(stmts, true);
+		const fixed = this.applyFixups(block, context);
+		const blockWhile = this.combineIfDoWhile(fixed);
 		const blockFor = this.combindeFor(blockWhile);
-		this.debugBlock(blockFor);
 
 		// for (const [instr, node] of nodes) {
 		// 	if (node.affects.length == 0) {
@@ -135,7 +136,14 @@ export class Decompiler {
 			if (!node) {
 				throw new Error('Instruction not in node dictionary');
 			}
-			if (node.affects.length == 0) {
+			if (node.instr.opcode === 'CreateEnvironment') {
+				const expr = this.emit(node, context);
+				const fixup = context.fixups.get(expr)!;
+				context.fixups.delete(expr);
+				const dummy = ts.factory.createEmptyStatement();
+				stmts.push(dummy);
+				context.fixups.set(dummy, fixup);
+			} else if (node.affects.length == 0) {
 				const expr = this.emit(node, context);
 
 				if (node.instr.opcode === 'Jmp') {
@@ -149,33 +157,33 @@ export class Decompiler {
 					if (node.instr.operands[0].value < 0) {
 						stmts = [
 							ts.factory.createDoStatement(
-								ts.factory.createBlock(this.convertBlock(block.tLabel, context, block)),
+								ts.factory.createBlock(this.convertBlock(block.tLabel, context, block), true),
 								expr
 							)
 						];
 						context.blocksConversion.set(block, stmts);
-					} else if (node.instr.opcode.startsWith('JNot')) {
+					} else if (node.instr.opcode.includes('Not')) {
 						const jmp = this.endsInJmp(block.fLabel, new Set(), block.tLabel.insts[0].ip);
 						if (jmp) {
 							stmts.push(ts.factory.createIfStatement(expr, 
-								ts.factory.createBlock(this.convertBlock(block.fLabel, context, jmp.tLabel)),
-								ts.factory.createBlock(this.convertBlock(block.tLabel, context, jmp.tLabel))));
+								ts.factory.createBlock(this.convertBlock(block.fLabel, context, jmp.tLabel), true),
+								ts.factory.createBlock(this.convertBlock(block.tLabel, context, jmp.tLabel), true)));
 							stmts.push(...this.convertBlock(jmp.tLabel, context, until));
 						} else {
 							stmts.push(ts.factory.createIfStatement(expr, 
-								ts.factory.createBlock(this.convertBlock(block.fLabel, context, block.tLabel))));
+								ts.factory.createBlock(this.convertBlock(block.fLabel, context, block.tLabel), true)));
 							stmts.push(...this.convertBlock(block.tLabel, context, until));
 						}
 					} else {
 						const jmp = this.endsInJmp(block.fLabel, new Set(), block.tLabel.insts[0].ip);
 						if (jmp) {
 							stmts.push(ts.factory.createIfStatement(expr, 
-								ts.factory.createBlock(this.convertBlock(block.tLabel, context, jmp.tLabel)),
-								ts.factory.createBlock(this.convertBlock(block.fLabel, context, jmp.tLabel))));
+								ts.factory.createBlock(this.convertBlock(block.tLabel, context, jmp.tLabel), true),
+								ts.factory.createBlock(this.convertBlock(block.fLabel, context, jmp.tLabel), true)));
 							stmts.push(...this.convertBlock(jmp.tLabel, context, until));
 						} else {
 							stmts.push(ts.factory.createIfStatement(ts.factory.createLogicalNot(expr),
-								ts.factory.createBlock(this.convertBlock(block.fLabel, context, block.tLabel))));
+								ts.factory.createBlock(this.convertBlock(block.fLabel, context, block.tLabel), true)));
 							stmts.push(...this.convertBlock(block.tLabel, context, until));
 						}
 					}
@@ -184,8 +192,8 @@ export class Decompiler {
 				} else {
 					stmts.push(ts.factory.createExpressionStatement(expr));
 				}
-			} else if (node.instr.opcode !== 'CreateEnvironment' && (node.affects.length > 1 
-				|| (node.affects[0].dependsOn.find(d => d?.includes(node))?.length ?? 0) > 1)) {
+			} else if (node.affects.length > 1 
+				|| (node.affects[0].dependsOn.find(d => d?.includes(node))?.length ?? 0) > 1) {
 				const stmt = this.save(node, context);
 				if (stmt) {
 					stmts.push(stmt);
@@ -306,12 +314,20 @@ export class Decompiler {
 			return ts.factory.createNumericLiteral(0);
 		case 'LoadConstUndefined':
 			return ts.factory.createIdentifier('undefined');
+		case 'LoadConstFalse':
+			return ts.factory.createFalse();
 		case 'LoadConstUInt8':
 			return ts.factory.createNumericLiteral(node.instr.operands[1].value as number);
 		case 'LoadParam':
 			return context.params[node.instr.operands[1].value as number];
+		case 'NewObject':
+			return ts.factory.createObjectLiteralExpression();
 		case 'GetGlobalObject':
 			return ts.factory.createIdentifier('globalThis');
+		case 'TypeOf':
+			return ts.factory.createTypeOfExpression(this.convertInstruction(node.dependsOn[1][0], context));
+		case 'JmpTrue':
+			return this.convertInstruction(node.dependsOn[1][0], context); //TODO: check
 		case 'JNotLess':
 			return ts.factory.createLessThan(this.convertInstruction(node.dependsOn[1][0], context), this.convertInstruction(node.dependsOn[2][0], context));
 		case 'JLess':
@@ -320,7 +336,18 @@ export class Decompiler {
 			return ts.factory.createEquality(this.convertInstruction(node.dependsOn[1][0], context), this.convertInstruction(node.dependsOn[2][0], context));
 		case 'JNotEqual':
 			return ts.factory.createEquality(this.convertInstruction(node.dependsOn[1][0], context), this.convertInstruction(node.dependsOn[2][0], context));
+		case 'JStrictEqual':
+			return ts.factory.createStrictEquality(this.convertInstruction(node.dependsOn[1][0], context), this.convertInstruction(node.dependsOn[2][0], context));
+		case 'JStrictNotEqual':
+			return ts.factory.createStrictEquality(this.convertInstruction(node.dependsOn[1][0], context), this.convertInstruction(node.dependsOn[2][0], context));
 		case 'TryGetById':
+			left = this.convertInstruction(node.dependsOn[1][0], context);
+			if (ts.isIdentifier(left) && left.text === 'globalThis') {
+				return ts.factory.createIdentifier(node.instr.operands[3].value as string);
+			}
+
+			return ts.factory.createPropertyAccessExpression(left, node.instr.operands[3].value as string);
+		case 'GetById':
 			left = this.convertInstruction(node.dependsOn[1][0], context);
 			if (ts.isIdentifier(left) && left.text === 'globalThis') {
 				return ts.factory.createIdentifier(node.instr.operands[3].value as string);
@@ -334,6 +361,14 @@ export class Decompiler {
 			}
 
 			return ts.factory.createPropertyAccessExpression(left, node.instr.operands[3].value as string);
+		case 'Call1':
+			if (node.dependsOn[2]) {
+				return ts.factory.createCallExpression(
+					ts.factory.createPropertyAccessExpression(this.convertInstruction(node.dependsOn[1][0], context), 'call'), 
+					undefined, 
+					[this.convertInstruction(node.dependsOn[2][0], context)]);
+			}
+			return ts.factory.createCallExpression(this.convertInstruction(node.dependsOn[1][0], context), undefined, []);
 		case 'Call2':
 			if (node.dependsOn[2]) {
 				return ts.factory.createCallExpression(
@@ -375,22 +410,65 @@ export class Decompiler {
 			return ts.factory.createReturnStatement(left) as unknown as ts.Expression;
 		case 'Mov':
 			return this.convertInstruction(node.dependsOn[1][0], context);
+		case 'LoadThisNS':
+			return ts.factory.createThis();
 		case 'DeclareGlobalVar':
 			return ts.factory.createAssignment(ts.factory.createIdentifier(node.instr.operands[0].value as string), ts.factory.createIdentifier('undefined'));
 		case 'CreateEnvironment': {
-			const dummyStatement = ts.factory.createEmptyStatement();
 			const dummyExpression = ts.factory.createVoidZero();
 			const env: Environment = {
 				parent: context.environment,
 				variables: []
 			};
-			context.fixups.set(dummyStatement, () => env.variables.map(
+			context.fixups.set(dummyExpression, () => env.variables.map(
 				v => v ? ts.factory.createVariableStatement(undefined, [
 					ts.factory.createVariableDeclaration(v)
 				]) : ts.factory.createEmptyStatement()
 			));
 			context.environments.set(dummyExpression, env);
 			return dummyExpression;
+		}
+		case 'GetEnvironment': {
+			const count = node.instr.operands[1].value as number;
+			let result = context.environment;
+			for (let i = 0; i < count; i++) {
+				result = result.parent;
+			}
+
+			for (const [dummy, env] of context.environments) {
+				if (env === result) {
+					return dummy;
+				}
+			}
+			//Ideally unreachable
+			const dummyExpression = ts.factory.createVoidZero();
+			context.environments.set(dummyExpression, result);
+			return dummyExpression;
+		}
+		case 'StoreToEnvironment': {
+			const dummyExpression = this.convertInstruction(node.dependsOn[0][0], context);
+			const index = node.instr.operands[1].value as number;
+			const value = this.convertInstruction(node.dependsOn[2][0], context);
+
+			const env = context.environments.get(dummyExpression);
+			if (!env) {
+				throw new Error('Invalid environment in StoreToEnvironment arg 0');
+			}
+
+			const ident = this.getEnvVariable(env, index);
+
+			return ts.factory.createAssignment(ident, value); 
+		}
+		case 'LoadFromEnvironment': {
+			const dummyExpression = this.convertInstruction(node.dependsOn[1][0], context);
+			const index = node.instr.operands[2].value as number;
+
+			const env = context.environments.get(dummyExpression);
+			if (!env) {
+				throw new Error('Invalid environment in LoadFromEnvironment arg 1');
+			}
+
+			return this.getEnvVariable(env, index); 
 		}
 		case 'PutById':
 			left = this.convertInstruction(node.dependsOn[0][0], context);
@@ -497,7 +575,7 @@ export class Decompiler {
 
 		const params: ts.Identifier[] = [];
 		for (let i = 0; i < func.paramCount; i++) {
-			params.push(ts.factory.createUniqueName('p'));
+			params.push(ts.factory.createUniqueName('p')); //ts.GeneratedIdentifierFlags.ReservedInNestedScopes
 		}
 
 		const childContext: Context = {
@@ -537,6 +615,16 @@ export class Decompiler {
 		const result: InstructionNode = {instr, affects: [], dependsOn: []};
 		context.nodeMap.set(instr, result);
 		return result;
+	}
+
+	private getEnvVariable(env: Environment, index: number) {
+		if (env.variables[index]) {
+			return env.variables[index];
+		}
+		
+		const ident = ts.factory.createUniqueName('c');
+		env.variables[index] = ident;
+		return ident;
 	}
 
 	private labels(insts: Instruction[]) {
@@ -617,20 +705,48 @@ export class Decompiler {
 
 	private inlineCalls(context: Context) {
 		for (const node of context.nodeMap.values()) {
-			if ((node.instr.opcode === 'Call2' || node.instr.opcode === 'Call4')
-			&& node.dependsOn[2].length === 1
-			&& node.dependsOn[2][0].affects.length === 2
-			&& node.dependsOn[2][0].affects[0] === node.dependsOn[1][0]
-			&& node.dependsOn[2][0].affects[1] === node) {
-				node.dependsOn[2][0].affects.pop();
-				delete node.dependsOn[2];
-			} else if ((node.instr.opcode === 'Call2' || node.instr.opcode === 'Call4')
-			&& node.dependsOn[2].length === 1
-			&& node.dependsOn[2][0].affects.length === 1
-			&& node.dependsOn[2][0].affects[0] === node) {
-				delete node.dependsOn[2];
+			if (node.instr.opcode === 'Call1' || node.instr.opcode === 'Call2' || node.instr.opcode === 'Call4'
+			&& node.dependsOn[2].length === 1) {
+				if (node.dependsOn[2][0].affects.length === 2
+				&& node.dependsOn[2][0].affects[0] === node.dependsOn[1][0]
+				&& node.dependsOn[2][0].affects[1] === node) {
+					node.dependsOn[2][0].affects.pop();
+					delete node.dependsOn[2];
+				} else if (node.dependsOn[2][0].affects.length === 1
+				&& node.dependsOn[2][0].affects[0] === node) {
+					delete node.dependsOn[2];
+				} else if (node.dependsOn[2][0].instr.opcode === 'LoadConstUndefined'){
+					delete node.dependsOn[2];
+					if (node.dependsOn[1].length !== 1
+						|| !['GetByIdShort', 'TryGetById'].includes(node.dependsOn[1][0].instr.opcode)
+						|| node.dependsOn[1][0].dependsOn[1].length !== 1
+						|| node.dependsOn[1][0].dependsOn[1][0].instr.opcode !== 'GetGlobalObject') {
+						node.dependsOn[1][0].affects.push(node);
+					}
+				}
 			}
 		}
+	}
+
+	private applyFixups(node: ts.Block, ctx: Context) {
+		const result= ts.transform(node, [(context: ts.TransformationContext) => (node) => 
+			ts.visitNode(node, function visit(node): ts.Node {
+				if (ts.isBlock(node)) {
+					const stmts = Array.from(node.statements);
+					const fixups = stmts.filter(s => ctx.fixups.has(s));
+					if (fixups.length) {
+						for (const fixup of fixups) {
+							const newStmts = ctx.fixups.get(fixup)!();
+							stmts.splice(stmts.indexOf(fixup), 1, ...newStmts);
+						}
+						return ts.visitEachChild(ts.factory.createBlock(stmts, true), visit, context);
+					}
+				}
+
+				return ts.visitEachChild(node, visit, context);
+			} as ts.Visitor)
+		]);
+		return result.transformed[0];
 	}
 
 	private combineIfDoWhile<T extends ts.Node>(node: T) {
@@ -676,7 +792,7 @@ export class Decompiler {
 							&& end.expression.left === end.expression.right.left
 							&& ts.isNumericLiteral(end.expression.right.right)) {
 
-								const inner = ts.factory.createBlock(current.statement.statements.slice(0, current.statement.statements.length-1));
+								const inner = ts.factory.createBlock(current.statement.statements.slice(0, current.statement.statements.length-1), true);
 
 								const increment = end.expression.right.right.text === '1'
 									? ts.factory.createPostfixIncrement(end.expression.left)
@@ -691,7 +807,7 @@ export class Decompiler {
 							}
 						}
 					}
-					node = ts.factory.createBlock(stmt);
+					node = ts.factory.createBlock(stmt, true);
 				}
 
 				return ts.visitEachChild(node, visit.bind(this), context);
