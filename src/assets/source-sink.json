@@ -172,5 +172,9 @@
     ],
     "LoadThisNS": [
         "source"
+    ],
+    "ToNumber": [
+        "source",
+        "sink"
     ]
 }
