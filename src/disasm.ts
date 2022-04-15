@@ -1,20 +1,11 @@
 import rawOpCodes from './assets/opcode.json';
-import sourceSinks from './assets/source-sink.json';
 import { FunctionHeader, HBCHeader } from './parser';
 
 export type OpCodeType = keyof typeof rawOpCodes;
 
-export enum SourceSinkType {
-	UNKNOWN,
-	SINK = 'sink',
-	SOURCE = 'source',
-	CONST = 'const'
-}
-
 export interface Operand {
 	type: string;
 	value: string | number;
-	kind: SourceSinkType
 }
 
 export interface Instruction {
@@ -58,17 +49,11 @@ export class Disassembler {
 
 			const opcode = this.opCodes[bc[ip]];
 			const ops = rawOpCodes[opcode];
-			const opKinds = sourceSinks[opcode as keyof typeof sourceSinks];
-			if (!opKinds) {
-				throw new Error('source-sink.json does not contain ' + opcode);
-			}
-
 			i++;
 			
 			const operands: Operand[] = [];
 			for (let j = 0; j < ops.length; j++) {
 				const operand = ops[j];
-				const kind = opKinds[j] as SourceSinkType ?? SourceSinkType.UNKNOWN;
 				const isStr = operand.endsWith(':S');
 				const type = !isStr ? operand : operand.substring(0, operand.length - 2);
 					
@@ -77,9 +62,9 @@ export class Disassembler {
 				i+=size;
 
 				if (isStr) {
-					operands.push({ type, kind, value: this.getString(value)});
+					operands.push({ type, value: this.getString(value)});
 				} else {
-					operands.push({ type, kind, value });
+					operands.push({ type, value });
 				}
 			}
 

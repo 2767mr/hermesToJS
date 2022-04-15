@@ -1,7 +1,10 @@
 import { ChildProcess, exec } from 'child_process';
 import fs from 'fs/promises';
 import process from 'process';
+import { createPrinter } from 'typescript';
+import { Decompiler } from './decomp';
 import { Disassembler } from './disasm';
+import { Optimizer } from './optimizer';
 import { Parser } from './parser';
 
 
@@ -29,6 +32,10 @@ export class Verify {
 		for (const func of header.functionHeaders) {
 			disasm.disassemble(func);
 		}
+		const x = new Decompiler(disasm, header);
+		const y = x.decompile('test.js');
+		const text = createPrinter().printFile(new Optimizer().optimize(y));
+		await fs.writeFile('result_verify.js', text);
 
 		try { await fs.unlink('tmp.bundle'); } catch {/* */}
 		try { await fs.unlink('tmp.js'); } catch {/* */ }
