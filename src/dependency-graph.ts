@@ -140,9 +140,16 @@ export class DependencyGraph {
 		}
 	}
 
-	public inlineNode(from: ts.Node, to: ts.Node, path: string): ts.Node {
-		this.assign(to, path, from);
-		return to;
+	public inlineNode(from: DependencyNode, src: string, to: DependencyNode, dst: string): ts.Node {
+		this.assign(to, '.node' + dst, this.access(from.node, src));
+		from.affects.splice(from.affects.indexOf(to), 1);
+		delete to.dependsOn[dst];
+		for (const [path, dep] of Object.entries(from.dependsOn)) {
+			if (path.startsWith(src)) {
+				to.dependsOn[dst + path.substring(src.length)] = dep;
+			}
+		}
+		return to.node;
 	}
 
 	public replace(from: ts.Statement, to: ts.Statement, dependsOn?: Record<string, DependencyNode[]>, affects?: DependencyNode[]) {
@@ -151,6 +158,16 @@ export class DependencyGraph {
 		node.dependsOn = dependsOn ?? node.dependsOn;
 		node.affects = affects ?? node.affects;
 		this.nodes.set(to, node);
+	}
+
+	private access(obj: unknown, path: string) {
+		while (path.length > 0) {
+			const nextDot = path.indexOf('.', 1);
+			const nextPath = path.substring(1, nextDot === -1 ? undefined : nextDot);
+			obj = (obj as Record<string, unknown>)[nextPath];
+			path = nextDot === -1 ? '' : path.substring(nextDot);
+		}
+		return obj;
 	}
 
 	private assign(obj: unknown, path: string, value: unknown) {

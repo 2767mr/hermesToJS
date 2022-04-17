@@ -9,6 +9,7 @@ export class Optimizer {
 		file = this.inlineGlobal(file);
 		const graph = new DependencyGraph(file);
 		file = this.inlineLiteral(file, graph);
+		file = this.inlineCall(file, graph);
 		file = this.removeWAW(file, graph);
 		file = this.inlinePreceding(file, graph);
 		return file;
@@ -76,7 +77,7 @@ export class Optimizer {
 						for (const to of from.affects) {
 							const [path] = Object.entries(to.dependsOn).find(([, val]) => val.includes(from))!;
 							if (to.dependsOn[path].length === 1) {
-								graph.inlineNode(stmt.expression.right, to.node, path);
+								graph.inlineNode(from, '.expression.right', to, path);
 								from.affects.splice(from.affects.indexOf(to), 1);
 							}
 						}
@@ -118,6 +119,84 @@ export class Optimizer {
 							const replaced = ts.factory.createExpressionStatement(stmt.expression.right);
 							stmts[i] = replaced;
 							graph.replace(stmt, replaced);
+						}
+					}
+				}
+
+				if (ts.isBlock(node)) {
+					node = ts.factory.updateBlock(node, stmts);
+				} else {
+					node = ts.factory.updateSourceFile(node, stmts);
+				}
+			}
+
+			return ts.visitEachChild(node, visit, ctx);
+		});
+	}
+
+	private inlineCall(file: ts.SourceFile, graph: DependencyGraph) {
+		return this.transform(file, (node, visit, ctx) => {
+			if (ts.isBlock(node) || ts.isSourceFile(node)) {
+				const stmts = Array.from(node.statements);
+				for (let i = 0; i < stmts.length; i++) {
+					const stmt = stmts[i];
+					const code = this.debug(stmt);
+
+					//Is call expression
+					if (ts.isExpressionStatement(stmt)
+						&& ts.isBinaryExpression(stmt.expression)
+						&& stmt.expression.operatorToken.kind === ts.SyntaxKind.FirstAssignment
+						&& ts.isIdentifier(stmt.expression.left)
+						&& ts.isCallExpression(stmt.expression.right)
+						&& ts.isPropertyAccessExpression(stmt.expression.right.expression)
+						&& ts.isIdentifier(stmt.expression.right.expression.expression)
+						&& ts.isIdentifier(stmt.expression.right.expression.name)
+						&& stmt.expression.right.expression.name.text === 'call'
+						&& ts.isIdentifier(stmt.expression.right.arguments[0])) {
+
+						const node = graph.nodes.get(stmt)!;
+						const callerDeps = node.dependsOn['.expression.right.expression.expression'];
+						const contextDeps = node.dependsOn['.expression.right.arguments.0'];
+
+						//Is only used once
+						if (callerDeps.length === 1 
+							&& contextDeps.length === 1
+							&& callerDeps[0].affects.length === 1
+							&& contextDeps[0].affects.length === 2
+							&& contextDeps[0].affects[0] === callerDeps[0]
+							//&& contextDeps[0].affects[1] === node //always true
+						) {
+							const contextIndex = stmts.indexOf(contextDeps[0].node);
+							const callerIndex = stmts.indexOf(callerDeps[0].node);
+
+							//Is in same block and sequential
+							if (contextIndex !== -1
+								&& callerIndex !== -1
+								&& callerIndex === contextIndex + 1) {
+									
+								//We can only inline it if there are no other dependencies
+								//TODO: it should be possible to replax this a bit
+								let noDeps = true;
+								for (let j = 1; j < stmt.expression.right.arguments.length; j++) {
+									if (node.dependsOn['.expression.right.arguments.' + j]?.length) {
+										noDeps = false;
+										break;
+									}
+								}
+
+								if (noDeps) {
+									graph.inlineNode(contextDeps[0], '.expression.right', callerDeps[0], Object.keys(callerDeps[0].dependsOn)[0]);
+									const inlined = graph.inlineNode(callerDeps[0], '.expression.right', node, '.expression.right.expression');
+									((inlined as any).expression.right.arguments as ts.Node[]).splice(0, 1);
+									for (let j = 1; j < stmt.expression.right.arguments.length; j++) {
+										node.dependsOn['.expression.right.arguments.' + (j - 1)] = node.dependsOn['.expression.right.arguments.' + j]; 
+									}
+									delete node.dependsOn['.expression.right.arguments.' + (stmt.expression.right.arguments.length - 1)];
+									stmts[i] = inlined as ts.Statement;
+									stmts.splice(contextIndex, 2);
+									i -= 2;
+								}
+							}
 						}
 					}
 				}
