@@ -18,5 +18,5 @@ const text = createPrinter().printFile(result);
 //const verify = new Verify();
 //verify.verify(text, data);
 
-console.log(result);
+//console.log(result);
 fs.writeFileSync('result.js', text);

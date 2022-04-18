@@ -1,5 +1,6 @@
 import structure from './assets/structure.json';
 import { Reader } from './reader';
+import { SerializedLiteralParser } from './slp';
 
 export type Header = {
     [T in keyof typeof structure.header]: (number | number[]);
@@ -190,9 +191,9 @@ export class Parser {
 		};
 
 		console.log('started slp');
-		//result.arrayValues = SerializedLiteralParser.parse(new Uint8Array(arrayBuffer), result);
-		//result.objKeyValues = SerializedLiteralParser.parse(new Uint8Array(objKeyBuffer), result);
-		//result.objValueValues = SerializedLiteralParser.parse(new Uint8Array(objValueBuffer), result);
+		result.arrayValues = SerializedLiteralParser.parse(new Uint8Array(arrayBuffer), result);
+		result.objKeyValues = SerializedLiteralParser.parse(new Uint8Array(objKeyBuffer), result);
+		result.objValueValues = SerializedLiteralParser.parse(new Uint8Array(objValueBuffer), result);
 		console.log('parsed slp');
 
 		return result;

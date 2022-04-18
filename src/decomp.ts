@@ -546,7 +546,7 @@ export class Decompiler {
 
 			const properties: ts.ObjectLiteralElementLike[] = [];
 			for (let i = 0; i < staticElements; i++) {
-				properties.push(ts.factory.createPropertyAssignment(this.header.objKeyValues[keyIndex + i] as string, 
+				properties.push(ts.factory.createPropertyAssignment('' + this.header.objKeyValues[keyIndex + i], 
 					this.toLiteral(this.header.objValueValues[valueIndex + i])));
 			}
 

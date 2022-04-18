@@ -1,4 +1,5 @@
 {
+    "Unreachable": [],
     "NewObjectWithBuffer": [
         "Reg8",
         "UInt16",
@@ -432,6 +433,15 @@
         "UInt8",
         "UInt8"
     ],
+    "CallBuiltinLong": [
+        "Reg8",
+        "UInt8",
+        "UInt32"
+    ],
+    "GetBuiltinClosure": [
+        "Reg8",
+        "UInt8"
+    ],
     "Ret": [
         "Reg8"
     ],
@@ -445,7 +455,8 @@
     "Throw": [
         "Reg8"
     ],
-    "ThrowIfUndefinedInst": [
+    "ThrowIfEmpty": [
+        "Reg8",
         "Reg8"
     ],
     "Debugger": [],
@@ -453,7 +464,6 @@
     "ProfilePoint": [
         "UInt16"
     ],
-    "Unreachable": [],
     "CreateClosure": [
         "Reg8",
         "Reg8",
@@ -470,6 +480,16 @@
         "UInt16"
     ],
     "CreateGeneratorClosureLongIndex": [
+        "Reg8",
+        "Reg8",
+        "UInt32"
+    ],
+    "CreateAsyncClosure": [
+        "Reg8",
+        "Reg8",
+        "UInt16"
+    ],
+    "CreateAsyncClosureLongIndex": [
         "Reg8",
         "Reg8",
         "UInt32"
@@ -511,6 +531,9 @@
     "LoadConstStringLongIndex": [
         "Reg8",
         "UInt32:S"
+    ],
+    "LoadConstEmpty": [
+        "Reg8"
     ],
     "LoadConstUndefined": [
         "Reg8"
@@ -833,6 +856,76 @@
     ],
     "JStrictNotEqualLong": [
         "Addr32",
+        "Reg8",
+        "Reg8"
+    ],
+    "Add32": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Sub32": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Mul32": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Divi32": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Divu32": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Loadi8": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Loadu8": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Loadi16": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Loadu16": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Loadi32": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Loadu32": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Store8": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Store16": [
+        "Reg8",
+        "Reg8",
+        "Reg8"
+    ],
+    "Store32": [
+        "Reg8",
         "Reg8",
         "Reg8"
     ]
