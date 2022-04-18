@@ -46,7 +46,7 @@ export class Decompiler {
 		private readonly header: HBCHeader,
 	) { }
 
-	public decompile() {
+	public decompile(file: string) {
 		const context: Context = {
 			environment: {} as Environment,
 			blocksConversion: new Map(),
@@ -57,8 +57,13 @@ export class Decompiler {
 			environments: new Map(),
 			params: [ts.factory.createUniqueName('p')]
 		};
-		const result = this.decompileFuction(this.header.functionHeaders[0], context);
-		this.debugBlock(result);
+		const result = this.decompileFuction(this.header.functionHeaders[0], context, true);
+
+		const src = this.createSourcefile(file, Array.from(result.statements), ts.ScriptTarget.Latest);
+		
+		const printer = ts.createPrinter();
+		
+		return printer.printFile(src);
 	}
 	private asRegister(operand: string | number) {
 		if (typeof operand !== 'string' || !operand.startsWith('Reg8:')) {
@@ -85,7 +90,7 @@ export class Decompiler {
 		return operand;
 	}
 
-	private decompileFuction(fHeader: FunctionHeader, context: Context): ts.Block {
+	private decompileFuction(fHeader: FunctionHeader, context: Context, isGlobal = false): ts.Block {
 		context.environment.parent = context.environment;
 		const insts = this.disasm.disassemble(fHeader);
 		const labels = this.labels(insts);
@@ -119,6 +124,24 @@ export class Decompiler {
 		// 		console.log('save', node);
 		// 	}
 		// }
+
+		if (isGlobal) {
+			const globals = insts
+				.filter(i => i.opcode === 'DeclareGlobalVar')
+				.map(i => 
+					ts.factory.createVariableDeclaration(i.operands[0].value as string)
+				);
+			return ts.factory.createBlock([
+				...(globals.length ? [ts.factory.createVariableStatement(undefined, globals)] : []),
+				ts.factory.createExpressionStatement(
+					ts.factory.createCallExpression(
+						ts.factory.createArrowFunction(undefined, undefined, [], undefined, undefined, blockFor),
+						undefined,
+						undefined
+					)
+				) as ts.Statement
+			]);
+		}
 
 		return blockFor;
 	}
@@ -187,10 +210,12 @@ export class Decompiler {
 							stmts.push(...this.convertBlock(block.tLabel, context, until));
 						}
 					}
-				} else if (ts.isReturnStatement(expr) || ts.isEmptyStatement(expr)) {
-					stmts.push(expr);
-				} else {
-					stmts.push(ts.factory.createExpressionStatement(expr));
+				} else if (!ts.isVoidExpression(expr)) {
+					if (ts.isReturnStatement(expr) || ts.isEmptyStatement(expr)) {
+						stmts.push(expr);
+					} else {
+						stmts.push(ts.factory.createExpressionStatement(expr));
+					}
 				}
 			} else if (node.affects.length > 1 
 				|| (node.affects[0].dependsOn.find(d => d?.includes(node))?.length ?? 0) > 1) {
@@ -413,7 +438,7 @@ export class Decompiler {
 		case 'LoadThisNS':
 			return ts.factory.createThis();
 		case 'DeclareGlobalVar':
-			return ts.factory.createAssignment(ts.factory.createIdentifier(node.instr.operands[0].value as string), ts.factory.createIdentifier('undefined'));
+			return ts.factory.createVoidZero();
 		case 'CreateEnvironment': {
 			const dummyExpression = ts.factory.createVoidZero();
 			const env: Environment = {
@@ -486,6 +511,8 @@ export class Decompiler {
 		case 'CreateClosure':
 			left = this.convertInstruction(node.dependsOn[1][0], context);
 			return this.createClosure(left, node.instr.operands[2].value as number, context);
+		case 'ToNumber':
+			return ts.factory.createCallExpression(ts.factory.createIdentifier('Number'), undefined, [this.convertInstruction(node.dependsOn[1][0], context)]);
 		case 'CallBuiltin':
 			//TODO
 			return ts.factory.createCallExpression(ts.factory.createIdentifier(node.instr.operands[1].value as string), undefined, []);
@@ -827,6 +854,15 @@ export class Decompiler {
 			} as ts.Visitor)
 		]);
 		return test.transformed[0];
+	}
+
+	private createSourcefile(filename: string, ast: ts.Node[], languageVersion: ts.ScriptTarget): ts.SourceFile {
+		const dummy = ts.createSourceFile(filename, 'dummy', languageVersion); // need at least 1 node
+	
+		return ts.transform(
+			dummy,
+			[ transformContext => sourceFile => ts.visitEachChild(sourceFile, () => ast, transformContext) ]
+		).transformed[0];
 	}
 
 	private debug(stmt: ts.Statement) {
