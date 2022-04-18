@@ -160,6 +160,16 @@ export class DependencyGraph {
 		this.nodes.set(to, node);
 	}
 
+	public replaceIdentifier(node: DependencyNode, identifier: ts.Identifier) {
+		for (const affect of node.affects) {
+			for (const [path, nodes] of Object.entries(affect.dependsOn)) {
+				if (nodes.some(n => n === node)) {
+					this.assign(affect.node, path, identifier);
+				}
+			}
+		}
+	}
+
 	private access(obj: unknown, path: string) {
 		while (path.length > 0) {
 			const nextDot = path.indexOf('.', 1);

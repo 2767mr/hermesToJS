@@ -51,7 +51,11 @@ export interface HBCHeader {
     cjsModuleTable: CJSModuleTableEntry[];
 
     instOffset: number;
-    inst: Uint8Array;
+    inst: ArrayBufferLike;
+
+	arrayValues: unknown[];
+	objKeyValues: unknown[];
+	objValueValues: unknown[];
 }
 
 export class Parser {
@@ -164,7 +168,7 @@ export class Parser {
 		}
 		this.align();
 
-		return {
+		const result: HBCHeader = {
 			arrayBuffer,
 			cjsModuleTable,
 			functionHeaders,
@@ -179,8 +183,19 @@ export class Parser {
 			stringTableEntries,
 			stringTableOverflowEntries,
 			instOffset: this.reader.tell(),
-			inst: this.reader.readAll()
+			inst: this.reader.readAll(),
+			arrayValues: [],
+			objKeyValues: [],
+			objValueValues: []
 		};
+
+		console.log('started slp');
+		//result.arrayValues = SerializedLiteralParser.parse(new Uint8Array(arrayBuffer), result);
+		//result.objKeyValues = SerializedLiteralParser.parse(new Uint8Array(objKeyBuffer), result);
+		//result.objValueValues = SerializedLiteralParser.parse(new Uint8Array(objValueBuffer), result);
+		console.log('parsed slp');
+
+		return result;
 	}
 
 	private cast(input: (string | number)[]): [string, number, number] {

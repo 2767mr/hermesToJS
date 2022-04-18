@@ -19,7 +19,7 @@ export class Disassembler {
 
 	private static readonly decoder = new TextDecoder();
 
-	private readonly operandType: Record<string, [number, (bytes: Uint8Array) => number]> = {
+	private readonly operandType: Record<string, [number, (bytes: ArrayBuffer) => number]> = {
 		'Reg8': [1, this.toUInt8],
 		'Reg32': [4, this.toUInt32],
 		'UInt8': [1, this.toUInt8],
@@ -44,10 +44,10 @@ export class Disassembler {
 		const bc = this.getByteCode(func);
 
 		const insts: Array<Instruction> = [];
-		for (let i = 0; i < bc.length;) {
+		for (let i = 0; i < bc.byteLength;) {
 			const ip = i;
 
-			const opcode = this.opCodes[bc[ip]];
+			const opcode = this.opCodes[this.toUInt8(bc.slice(ip))];
 			const ops = rawOpCodes[opcode];
 			i++;
 			
@@ -94,15 +94,18 @@ export class Disassembler {
 		// stringTableOverflowEntries = self.getObj()["stringTableOverflowEntries"]
 
 		const overflow = entry.length >= ((1 << 8) - 1);
+		try {
+			const isUTF16 = entry.isUTF16;
+			const offset = overflow ? overflowEntry.offset : entry.offset;
+			const length = overflow ? overflowEntry.length : entry.length;
 
-		const isUTF16 = entry.isUTF16;
-		const offset = overflow ? overflowEntry.offset : entry.offset;
-		const length = overflow ? overflowEntry.length : entry.length;
+			const multiplier = isUTF16 ? 2 : 1; 
 
-		const multiplier = isUTF16 ? 2 : 1; 
-
-		const bytes = this.header.stringStorage.slice(offset, offset + length * multiplier);
-		return isUTF16 ? Buffer.from(bytes).toString('hex') : Disassembler.decoder.decode(bytes);
+			const bytes = this.header.stringStorage.slice(offset, offset + length * multiplier);
+			return isUTF16 ? Buffer.from(bytes).toString('hex') : Disassembler.decoder.decode(bytes);
+		} catch (e) {
+			return 'Decompiler error: ' + e;
+		}
 	}
 
 	private getByteCode(func: FunctionHeader) {
@@ -112,25 +115,25 @@ export class Disassembler {
 		return this.header.inst.slice(start, end);
 	}
 
-	private toUInt8(bytes: Uint8Array) {
-		return bytes[0];
+	private toUInt8(bytes: ArrayBufferLike) {
+		return new Uint8Array(bytes)[0];
 	}
-	private toUInt16(bytes: Uint8Array) {
+	private toUInt16(bytes: ArrayBufferLike) {
 		return new Uint16Array(bytes)[0];
 	}
 
-	private toUInt32(bytes: Uint8Array) {
+	private toUInt32(bytes: ArrayBufferLike) {
 		return new Uint32Array(bytes)[0];
 	}
 
-	private toInt8(bytes: Uint8Array) {
+	private toInt8(bytes: ArrayBufferLike) {
 		return new Int8Array(bytes)[0];
 	}
-	private toInt32(bytes: Uint8Array) {
+	private toInt32(bytes: ArrayBufferLike) {
 		return new Int32Array(bytes)[0];
 	}
 
-	private toDouble(bytes: Uint8Array) {
+	private toDouble(bytes: ArrayBufferLike) {
 		return new Float64Array(bytes)[0];
 	}
 }

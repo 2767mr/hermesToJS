@@ -1,5 +1,5 @@
 import ts from 'typescript';
-import { DependencyGraph } from './dependency-graph';
+import { DependencyGraph, DependencyNode } from './dependency-graph';
 
 
 export class Optimizer {
@@ -12,6 +12,7 @@ export class Optimizer {
 		file = this.inlineCall(file, graph);
 		file = this.removeWAW(file, graph);
 		file = this.inlinePreceding(file, graph);
+		file = this.inlineVariableDeclarations(file, graph);
 		return file;
 	}
 	
@@ -118,7 +119,15 @@ export class Optimizer {
 						if (from.affects.length === 0) {
 							const replaced = ts.factory.createExpressionStatement(stmt.expression.right);
 							stmts[i] = replaced;
-							graph.replace(stmt, replaced);
+
+							const deps: Record<string, DependencyNode[]> = {};
+							for (const [path, nodes] of Object.entries(from)) {
+								if (path.startsWith('.expression.right')) {
+									deps[path.substring('.expression.right'.length)] = nodes;
+								}
+							}
+
+							graph.replace(stmt, replaced, deps);
 						}
 					}
 				}
@@ -170,6 +179,7 @@ export class Optimizer {
 							const callerIndex = stmts.indexOf(callerDeps[0].node);
 
 							//Is in same block and sequential
+							//TODO: make sure caller statement is PropertyAccessExpression
 							if (contextIndex !== -1
 								&& callerIndex !== -1
 								&& callerIndex === contextIndex + 1) {
@@ -290,6 +300,63 @@ export class Optimizer {
 						// 	stmts[i] = replaced;
 						// 	graph.replace(stmt, replaced);
 						// }
+					}
+				}
+
+				if (ts.isBlock(node)) {
+					node = ts.factory.updateBlock(node, stmts);
+				} else {
+					node = ts.factory.updateSourceFile(node, stmts);
+				}
+			}
+
+			return ts.visitEachChild(node, visit, ctx);
+		});
+	}
+
+	private inlineVariableDeclarations(file: ts.SourceFile, graph: DependencyGraph) {
+		return this.transform(file, (node, visit, ctx) => {
+			if (ts.isBlock(node) || ts.isSourceFile(node)) {
+				const stmts = Array.from(node.statements);
+				for (let i = 0; i < stmts.length; i++) {
+					const stmt = stmts[i];
+					const code = this.debug(stmt);
+					if (ts.isExpressionStatement(stmt)
+                    && ts.isBinaryExpression(stmt.expression)
+                    && stmt.expression.operatorToken.kind === ts.SyntaxKind.FirstAssignment
+					&& ts.isIdentifier(stmt.expression.left)) {
+						//All dependencies of stmt.expression.left must be inside the same block and after i
+
+						const node = graph.nodes.get(stmt)!;
+						const affects = new Set(node.affects.map(d => d.node));
+						if (affects.has(stmt)) {
+							continue;
+						}
+
+						for (let j = i + 1; j < stmts.length && affects.size > 0; j++) {
+							this.nodeAndForEachDescendant(stmts[j], n => {
+								affects.delete(n as ts.Statement);
+							});
+						}
+
+						if (affects.size === 0) {
+							const newId = ts.factory.createUniqueName('l');
+							graph.replaceIdentifier(node, newId);
+							const replaced = ts.factory.createVariableStatement(
+								undefined,
+								ts.factory.createVariableDeclarationList(
+									[ts.factory.createVariableDeclaration(
+										newId,
+										undefined,
+										undefined,
+										stmt.expression.right
+									)],
+									ts.NodeFlags.Let
+								)
+							);
+							stmts[i] = replaced;
+							graph.replace(stmt, replaced);
+						}
 					}
 				}
 
