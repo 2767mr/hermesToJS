@@ -514,6 +514,7 @@ export class Decompiler {
 
 			return this.assign(ctx, node, 0, this.getEnvVariable(env, index)); 
 		}
+		case 'TryPutById':
 		case 'PutById':
 			left = this.toIdentifier(ctx, node, 0);
 			if (ts.isIdentifier(left) && left.text === 'globalThis') {
