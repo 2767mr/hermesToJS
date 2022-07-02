@@ -3,24 +3,46 @@ import { DependencyGraph, DependencyNode } from './dependency-graph';
 
 
 export class Optimizer {
-	public optimize(file: ts.SourceFile) {		
-		ts.createPrinter().printFile(file);
+	public optimize(file: ts.SourceFile) {
+		return this.transform(file, (node, visit, ctx) => {
+			if (ts.isSourceFile(node)) {
+				node = this.optimizeBlock(node, file);
+			} else if (ts.isFunctionExpression(node)) {
+				node = ts.factory.updateFunctionExpression(node, 
+					node.modifiers, 
+					node.asteriskToken, 
+					node.name, 
+					node.typeParameters,
+					node.parameters,
+					node.type,
+					this.optimizeBlock(node.body, file));
+			}
 
-		file = this.inlineGlobal(file);
-		const graph = new DependencyGraph(file);
-		file = this.inlineLiteral(file, graph);
-		file = this.inlineCall(file, graph);
-		file = this.removeWAW(file, graph);
-		file = this.inlinePreceding(file, graph);
-		file = this.inlineVariableDeclarations(file, graph);
-		return file;
+			return ts.visitEachChild(node, visit, ctx);
+		});
+	}
+
+	private optimizeBlock<T extends ts.SourceFile | ts.Block>(block: T, file: ts.SourceFile): T {
+		//block = this.inlineGlobal(block);
+		const graph = new DependencyGraph(file, block);
+		block = this.inlineGlobalThis(block, graph);
+		block = this.inlineLiteral(block, graph);
+		// block = this.inlineCall(block, graph);
+		// block = this.removeWAW(block, graph);
+		// block = this.inlinePreceding(block, graph);
+		// block = this.inlineVariableDeclarations(block, graph);
+		return block;
 	}
 	
 	//Assumes that globalThis has it's own reserved variable and removes it
-	private inlineGlobal(file: ts.SourceFile) {
+	private inlineGlobal<T extends ts.SourceFile | ts.Block>(file: T) {
 		const globalRegs = new Set<ts.Identifier>();
 
 		return this.transform(file, (node, visit, ctx) => {
+			if (ts.isFunctionExpression(node)) {
+				return node;
+			}
+
 			if (ts.isBlock(node) || ts.isSourceFile(node)) {
 				const stmts = Array.from(node.statements);
 				for (let i = 0; i < stmts.length; i++) {
@@ -56,10 +78,106 @@ export class Optimizer {
 		});
 	}
 
-	
-	//Inlines literals that have reserved variables
-	private inlineLiteral(file: ts.SourceFile, graph: DependencyGraph) {
+	//Inlines globalThis
+	private inlineGlobalThis<T extends ts.SourceFile | ts.Block>(file: T, graph: DependencyGraph) {
 		return this.transform(file, (node, visit, ctx) => {
+			if (ts.isFunctionExpression(node)) {
+				return node;
+			}
+
+			if (ts.isBlock(node) || ts.isSourceFile(node)) {
+				const stmts = Array.from(node.statements);
+				for (let i = 0; i < stmts.length; i++) {
+					const stmt = stmts[i];
+					const code = this.debug(stmt);
+					if (ts.isExpressionStatement(stmt)
+                    && ts.isBinaryExpression(stmt.expression)
+                    && stmt.expression.operatorToken.kind === ts.SyntaxKind.FirstAssignment
+					&& ts.isIdentifier(stmt.expression.left)
+					&& ts.isPropertyAccessExpression(stmt.expression.right)
+					&& ts.isIdentifier(stmt.expression.right.expression)) {
+						const node = graph.nodes.get(stmt)!;
+						const deps = node.dependsOn['.expression.right.expression'];
+						if (deps.length === 1) {
+							const from = deps[0].node;
+							if (ts.isExpressionStatement(from)
+							&& ts.isBinaryExpression(from.expression)
+							&& from.expression.operatorToken.kind === ts.SyntaxKind.FirstAssignment
+							&& ts.isIdentifier(from.expression.left)
+							&& ts.isIdentifier(from.expression.right)
+							&& from.expression.right.text === 'globalThis') {
+								const toStmt = node.node as ts.ExpressionStatement;
+								const toExpr = toStmt.expression as ts.BinaryExpression;
+								const toExprRight = toExpr.right as ts.PropertyAccessExpression;
+								const replaced = ts.factory.updateExpressionStatement(
+									toStmt,
+									ts.factory.updateBinaryExpression(
+										toExpr,
+										toExpr.left,
+										toExpr.operatorToken,
+										toExprRight.name
+									)
+								);
+								graph.replace(node.node, replaced, {});
+								stmts[i] = replaced;
+								deps[0].affects.splice(deps[0].affects.indexOf(node), 1);
+							}
+						}
+					}
+					if (ts.isExpressionStatement(stmt)
+                    && ts.isBinaryExpression(stmt.expression)
+                    && stmt.expression.operatorToken.kind === ts.SyntaxKind.FirstAssignment
+					&& ts.isPropertyAccessExpression(stmt.expression.left)
+					&& ts.isIdentifier(stmt.expression.left.expression)) {
+						const node = graph.nodes.get(stmt)!;
+						const deps = node.dependsOn['.expression.left.expression'];
+						if (deps.length === 1) {
+							const from = deps[0].node;
+							if (ts.isExpressionStatement(from)
+							&& ts.isBinaryExpression(from.expression)
+							&& from.expression.operatorToken.kind === ts.SyntaxKind.FirstAssignment
+							&& ts.isIdentifier(from.expression.left)
+							&& ts.isIdentifier(from.expression.right)
+							&& from.expression.right.text === 'globalThis') {
+								const toStmt = node.node as ts.ExpressionStatement;
+								const toExpr = toStmt.expression as ts.BinaryExpression;
+								const toExprLeft = toExpr.left as ts.PropertyAccessExpression;
+								const replaced = ts.factory.updateExpressionStatement(
+									toStmt,
+									ts.factory.updateBinaryExpression(
+										toExpr,
+										toExprLeft.name,
+										toExpr.operatorToken,
+										toExpr.right
+									)
+								);
+								graph.replace(node.node, replaced);
+								delete node.dependsOn['.expression.left.expression'];
+								stmts[i] = replaced;
+								deps[0].affects.splice(deps[0].affects.indexOf(node), 1);
+							}
+						}
+					}
+				}
+
+				if (ts.isBlock(node)) {
+					node = ts.factory.updateBlock(node, stmts);
+				} else {
+					node = ts.factory.updateSourceFile(node, stmts);
+				}
+			}
+
+			return ts.visitEachChild(node, visit, ctx);
+		});
+	}
+	
+	//Inlines literals
+	private inlineLiteral<T extends ts.SourceFile | ts.Block>(file: T, graph: DependencyGraph) {
+		return this.transform(file, (node, visit, ctx) => {
+			if (ts.isFunctionExpression(node)) {
+				return node;
+			}
+
 			if (ts.isBlock(node) || ts.isSourceFile(node)) {
 				const stmts = Array.from(node.statements);
 				for (let i = 0; i < stmts.length; i++) {
@@ -70,6 +188,7 @@ export class Optimizer {
                     && stmt.expression.operatorToken.kind === ts.SyntaxKind.FirstAssignment
 					&& ts.isIdentifier(stmt.expression.left)
 					&& (ts.isStringLiteral(stmt.expression.right) || ts.isNumericLiteral(stmt.expression.right))) {
+						//TODO: invert
 						const from = graph.nodes.get(stmt)!;
 						if (!from) {
 							console.warn('Stmt not in nodes: ' + code);
@@ -79,12 +198,7 @@ export class Optimizer {
 							const [path] = Object.entries(to.dependsOn).find(([, val]) => val.includes(from))!;
 							if (to.dependsOn[path].length === 1) {
 								graph.inlineNode(from, '.expression.right', to, path);
-								from.affects.splice(from.affects.indexOf(to), 1);
 							}
-						}
-						if (from.affects.length === 0) {
-							stmts.splice(i, 1);
-							i--;
 						}
 					}
 				}
@@ -373,7 +487,9 @@ export class Optimizer {
 
 	private nodeAndForEachDescendant(node: ts.Node, visitor: (node: ts.Node) => void) {
 		visitor(node);
-		ts.forEachChild(node, (n) => this.nodeAndForEachDescendant(n, visitor));
+		if (!ts.isFunctionExpression(node)) {
+			ts.forEachChild(node, (n) => this.nodeAndForEachDescendant(n, visitor));
+		}
 	}
 
 	private transform<T extends ts.Node>(node: T, transformer: (node: ts.Node, visit: (node: ts.Node) => ts.Node, ctx: ts.TransformationContext) => ts.Node) {

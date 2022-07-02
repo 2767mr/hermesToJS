@@ -14,8 +14,11 @@ export interface DependencyNode {
 export class DependencyGraph {
 	public readonly nodes = new Map<ts.Statement, DependencyNode>();
 
-	public constructor(private readonly file: ts.SourceFile) {
-		this.analyse(file, new Map());
+	public constructor(
+		private readonly file: ts.SourceFile,
+		readonly block: ts.SourceFile | ts.Block,
+	) {
+		this.analyse(block, new Map());
 
 		for (const [_, node] of this.nodes) {
 			console.log(debug(node.node, file).split('\n')[0]);
@@ -64,6 +67,9 @@ export class DependencyGraph {
 			if (ts.isExpressionStatement(stmt)
 			&& ts.isBinaryExpression(stmt.expression)
 			&& stmt.expression.operatorToken.kind === ts.SyntaxKind.FirstAssignment) {
+				if (!ts.isIdentifier(stmt.expression.left)) {
+					markDependency(stmt.expression.left, newNode, '.expression.left');
+				}
 				markDependency(stmt.expression.right, newNode, '.expression.right');
 
 				const id = stmt.expression.left as ts.Identifier;
@@ -113,6 +119,10 @@ export class DependencyGraph {
 
 	private nodeAndForEachDescendant(node: ts.Node, visitor: (node: ts.Node, path: string) => void, path = '') {
 		visitor(node, path);
+
+		if (ts.isFunctionExpression(node)) {
+			return;
+		}
 		
 		const visitCount = new Map<ts.Node | ts.NodeArray<ts.Node>, number>();
 		

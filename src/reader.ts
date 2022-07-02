@@ -83,7 +83,7 @@ export class Reader {
 	}
     
 	public readAll() {
-		const a = this.input.buffer.slice(this.position);
+		const a = new Uint8Array(this.input).buffer.slice(this.position);
 		this.position += a.byteLength;
 		return a;
 	}

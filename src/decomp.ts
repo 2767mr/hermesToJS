@@ -39,7 +39,6 @@ interface Context {
 
 export class Decompiler {
 	private sourceFile!: ts.SourceFile;
-	private readonly printer = ts.createPrinter();
 
 	public constructor(
 		private readonly disasm: Disassembler,
@@ -55,7 +54,7 @@ export class Decompiler {
 			nodeConversion: new Map(),
 			fixups: new Map(),
 			environments: new Map(),
-			params: [ts.factory.createIdentifier('p' + (this.nextID++))],
+			params: [ts.factory.createUniqueName('p', ts.GeneratedIdentifierFlags.ReservedInNestedScopes)],
 			registers: [],
 		};
 		const result = this.decompileFuction(this.header.functionHeaders[0], context);
@@ -717,12 +716,10 @@ export class Decompiler {
 		if (typeof value === 'number') {
 			return ts.factory.createNumericLiteral(value);
 		}
-		return ts.factory.createStringLiteral(''); //TODO: remove debug;
+		
 		throw new Error('Unknown literal type: ' + typeof value);
 	}
 
-	//TODO: remove
-	private nextID = 1;
 	private toIdentifier(ctx: Context, node: InstructionNode, index: number) {
 		const result = ctx.registers[node.instr.operands[index].value as number];
 		if (result) {
@@ -730,7 +727,7 @@ export class Decompiler {
 		}
 
 		return ctx.registers[node.instr.operands[index].value as number]
-			= ts.factory.createIdentifier('r' + (this.nextID++));
+			= ts.factory.createUniqueName('r', ts.GeneratedIdentifierFlags.ReservedInNestedScopes);
 	}
 
 	private assign(ctx: Context, node: InstructionNode, index: number, tsNode: ts.Expression) {
@@ -745,7 +742,7 @@ export class Decompiler {
 
 		const params: ts.Identifier[] = [];
 		for (let i = 0; i < func.paramCount; i++) {
-			params.push(ts.factory.createIdentifier('p' + (this.nextID++))); //ts.GeneratedIdentifierFlags.ReservedInNestedScopes
+			params.push(ts.factory.createUniqueName('p', ts.GeneratedIdentifierFlags.ReservedInNestedScopes)); //ts.GeneratedIdentifierFlags.ReservedInNestedScopes
 		}
 
 		const childContext: Context = {
@@ -779,12 +776,13 @@ export class Decompiler {
 		return result;
 	}
 
+	private nextID = 1;
 	private getEnvVariable(env: Environment, index: number) {
 		if (env.variables[index]) {
 			return env.variables[index];
 		}
 		
-		const ident = ts.factory.createIdentifier('c' + (this.nextID++));
+		const ident = ts.factory.createUniqueName('c' + (this.nextID++));
 		env.variables[index] = ident;
 		return ident;
 	}
@@ -888,7 +886,7 @@ export class Decompiler {
 		const visitedStmts = new Set<ts.Statement>();
 		const result= ts.transform(node, [(context: ts.TransformationContext) => (node) => 
 			ts.visitNode(node, function visit(node): ts.Node {
-				if (ts.isFunctionExpression(node) || ts.isIdentifier(node)) {
+				if (ts.isIdentifier(node)) {
 					return node;
 				}
 				if (visitedNodes.has(node)) {
@@ -899,29 +897,28 @@ export class Decompiler {
 				visitedNodes.add(node);
 
 				if (ts.isBlock(node)) {
-					return ts.visitEachChild(node, visit, context);
-					// const stmts = Array.from(node.statements);
-					// const fixups = stmts.filter(s => ctx.fixups.has(s));
-					// if (fixups.length) {
-					// 	for (const fixup of fixups) {
-					// 		const newStmts = ctx.fixups.get(fixup)!();
-					// 		stmts.splice(stmts.indexOf(fixup), 1, ...newStmts);
-					// 	}
+					//return ts.visitEachChild(node, visit, context);
+					const stmts = Array.from(node.statements);
+					const fixups = stmts.filter(s => ctx.fixups.has(s));
+					if (fixups.length) {
+						for (const fixup of fixups) {
+							const newStmts = ctx.fixups.get(fixup)!();
+							stmts.splice(stmts.indexOf(fixup), 1, ...newStmts);
+						}
 
-					// 	for (let i = 0; i < stmts.length; i++) {
-					// 		if (visitedStmts.has(stmts[i])) {
-					// 			console.log('loop detected');
-					// 			stmts.splice(i, 1);
-					// 			i--;
-					// 		} else {
-					// 			visitedStmts.add(stmts[i]);
-					// 			stmts[i] = ts.visitEachChild(stmts[i], visit, context);
-					// 		}
-					// 	}
+						for (let i = 0; i < stmts.length; i++) {
+							if (visitedStmts.has(stmts[i])) {
+								console.log('loop detected');
+								stmts.splice(i, 1);
+								i--;
+							} else {
+								visitedStmts.add(stmts[i]);
+								stmts[i] = ts.visitEachChild(stmts[i], visit, context);
+							}
+						}
 
-					// 	return node; //TODO
-					// 	return ts.factory.createBlock(stmts, true);
-					// }
+						return ts.factory.createBlock(stmts, true);
+					}
 					
 				}
 
