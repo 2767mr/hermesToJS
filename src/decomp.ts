@@ -1114,7 +1114,7 @@ export class Decompiler {
 			return ctx.regs[register];
 		}
 
-		return ctx.regs[register] = ts.factory.createIdentifier('r' + register);
+		return ctx.regs[register] = ts.factory.createIdentifier('__reg__' + register);
 	}
 
 	private getParameter(ctx: Context, nr: number) {
@@ -1142,7 +1142,7 @@ export class Decompiler {
 			return env.vars[nr];
 		}
 
-		return env.vars[nr] = ts.factory.createIdentifier('e' + nr);
+		return env.vars[nr] = ts.factory.createIdentifier('__envreg__' + nr);
 	}
 	
 	private toLiteral(value: unknown): ts.Expression {
