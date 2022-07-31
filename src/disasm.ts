@@ -5,7 +5,7 @@ export type OpCodeType = keyof typeof rawOpCodes;
 
 export interface Operand {
 	type: string;
-	value: string | number;
+	value: string | number | number[];
 }
 
 export interface Instruction {
@@ -42,6 +42,7 @@ export class Disassembler {
 		//console.log(name);
 
 		const bc = this.getByteCode(func);
+		const all = this.getAllByteCode(func);
 
 		const insts: Array<Instruction> = [];
 		for (let i = 0; i < bc.byteLength;) {
@@ -66,6 +67,25 @@ export class Disassembler {
 				} else {
 					operands.push({ type, value });
 				}
+			}
+
+			if (opcode === 'SwitchImm') {
+				const jumpTable = operands[1].value as number;
+				//const defaultAddr = inst.operands[2].value as number; //Is already covered by default logic because of type Addr32
+				const min = operands[3].value as number;
+				const max = operands[4].value as number;
+
+				const bcOffset = func.offset - this.header.instOffset;
+				const addr = ip + jumpTable;
+				const start = this.align(addr + bcOffset, 4) - bcOffset;
+				const count = max - min + 1;
+				const values = new Array<number>(count);
+
+				for (let i = 0; i < count; i++) {
+					values[i] = this.toInt32(all.slice(start + i * 4, start + (i + 1) * 4));
+				}
+					
+				operands[1].value = values;
 			}
 
 			insts.push({ip, opcode, operands});
@@ -115,6 +135,11 @@ export class Disassembler {
 		return this.header.inst.slice(start, end);
 	}
 
+	private getAllByteCode(func: FunctionHeader) {
+		const start = func.offset - this.header.instOffset;
+		return this.header.inst.slice(start);
+	}
+
 	private toUInt8(bytes: ArrayBufferLike) {
 		return new Uint8Array(bytes)[0];
 	}
@@ -135,5 +160,14 @@ export class Disassembler {
 
 	private toDouble(bytes: ArrayBufferLike) {
 		return new Float64Array(bytes)[0];
+	}
+
+	private align(value: number, align: number) {
+		const leftover = value % align;
+		if (leftover === 0) {
+			return value;
+		}
+
+		return value + (align - leftover);
 	}
 }

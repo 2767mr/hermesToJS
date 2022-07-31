@@ -2,6 +2,7 @@ import structure from './assets/structure.json';
 import { Reader } from './reader';
 import { SerializedLiteralParser } from './slp';
 
+
 export type Header = {
     [T in keyof typeof structure.header]: (number | number[]);
 }
@@ -13,6 +14,7 @@ export interface FunctionHeader {
     bytecodeSizeInBytes: number;
     functionName: number;
 	paramCount: number;
+	frameSize: number;
     [key: string]: unknown;
 }
 
@@ -191,9 +193,18 @@ export class Parser {
 		};
 
 		console.log('started slp');
+
+		// Object.assign(result, JSON.parse(require('fs').readFileSync('slp.json', 'utf8')));
+
 		result.arrayValues = SerializedLiteralParser.parse(new Uint8Array(arrayBuffer), result);
 		result.objKeyValues = SerializedLiteralParser.parse(new Uint8Array(objKeyBuffer), result);
 		result.objValueValues = SerializedLiteralParser.parse(new Uint8Array(objValueBuffer), result);
+
+		// fs.writeFileSync('slp.json', JSON.stringify({
+		// 	arrayValues: result.arrayValues,
+		// 	objKeyValues: result.objKeyValues,
+		// 	objValueValues: result.objValueValues,
+		// }));
 		console.log('parsed slp');
 
 		return result;

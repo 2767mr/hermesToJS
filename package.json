@@ -5,7 +5,9 @@
   "main": "dist/main.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "tsc"
+    "start": "node --max_old_space_size=65536 ./dist/main.js",
+    "build": "tsc",
+    "watch": "nodemon --exec \"npm run build && npm start\" -e ts --ignore dist/"
   },
   "author": "2767mr",
   "license": "MIT",
@@ -16,6 +18,7 @@
     "@types/node": "^17.0.8",
     "@typescript-eslint/eslint-plugin": "^5.9.1",
     "@typescript-eslint/parser": "^5.9.1",
-    "eslint": "^8.6.0"
+    "eslint": "^8.6.0",
+    "nodemon": "^2.0.18"
   }
 }

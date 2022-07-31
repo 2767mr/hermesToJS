@@ -1,705 +1,1150 @@
-import * as ts from 'typescript';
-import { Disassembler, Instruction, Operand } from './disasm';
+import ts from 'typescript';
+
+import { CodeBlock, ControlflowBuilder, ControlflowNode } from './controlflow';
+import { Disassembler, Instruction } from './disasm';
 import { FunctionHeader, HBCHeader } from './parser';
-
-enum BlockType {
-	DEFAULT,
-	JUMP,
-	IF,
-	LOOP,
-}
-
-interface Block {
-	type: BlockType;
-	insts: Instruction[];
-	tLabel: Block;
-	fLabel: Block;
-}
-
-interface InstructionNode {
-	instr: Instruction;
-	inline?: true;
-}
 
 interface Environment {
 	parent: Environment;
-	variables: ts.Identifier[];
+
+	vars: ts.Identifier[];
+	origin: ts.Statement;
 }
 
 interface Context {
-	environment: Environment;
-	nodeConversion: Map<InstructionNode, ts.Node>;
-	blocksConversion: Map<Block, ts.Statement[]>;
-	fixups: Map<ts.Node, () => ts.Statement[]>;
-	environments: Map<ts.Expression, Environment>;
 	params: ts.Identifier[];
-	registers: ts.Identifier[];
+	regs: ts.Identifier[];
+	env: Environment;
+
+	envs: Environment[];
+	queue: [Scope, ControlflowNode, ts.Statement][];
+	completed: Map<ts.Statement, ts.Statement>;
 }
 
+interface Scope {
+	parent: Scope;
+	context: Context;
+	envRegs: Environment[];
+}
 
 export class Decompiler {
-	private sourceFile!: ts.SourceFile;
+	private static readonly warnings = new Set<string>();
+	private readonly ctrlFlowBuilder = new ControlflowBuilder(this.disassembler);
+	private count = 0;
 
-	public constructor(
-		private readonly disasm: Disassembler,
+	constructor(
+		private readonly disassembler: Disassembler,
 		private readonly header: HBCHeader,
-	) { }
-
-	public decompile(outfile: string) {
-		this.sourceFile = this.createSourcefile(outfile, [], ts.ScriptTarget.Latest);
-
-		const context: Context = {
-			environment: {} as Environment,
-			blocksConversion: new Map(),
-			nodeConversion: new Map(),
-			fixups: new Map(),
-			environments: new Map(),
-			params: [ts.factory.createUniqueName('p', ts.GeneratedIdentifierFlags.ReservedInNestedScopes)],
-			registers: [],
-		};
-		const result = this.decompileFuction(this.header.functionHeaders[0], context);
-
-		return ts.factory.updateSourceFile(this.sourceFile, Array.from(result.statements));
+	) {
+		
 	}
-	private asOffset(operand: Operand, ip: number) {
-		if ((operand.type !== 'Addr8' && operand.type !== 'Addr32') || typeof operand.value !== 'number') {
-			throw new Error(`Invalid number: ${operand}`);
+
+	public decompile() {
+		const topEnv: Environment = {vars: [], parent: {} as Environment, origin: ts.factory.createEmptyStatement()};
+		topEnv.parent = topEnv;
+		const func = this.decompileFunction({
+			params: [],
+			regs: [],
+			env: topEnv,
+			envs: [],
+			queue: [],
+			completed: new Map(),
+		}, this.header.functionHeaders[0]);
+		for (const warning of Decompiler.warnings) {
+			console.warn('Opcode not implemented: ' + warning);
 		}
-		return operand.value + ip;
+		return ts.factory.createExpressionStatement(
+			ts.factory.createCallExpression(func, [], [])
+		);
 	}
 
-	private decompileFuction(fHeader: FunctionHeader, context: Context): ts.Block {
-		context.environment.parent = context.environment;
-		const insts = this.disasm.disassemble(fHeader);
-		const labels = this.labels(insts);
-		const blocks = this.blocks(insts, labels);
-		const flow = this.blockFlow(blocks);
+	private decompileFunction(ctx: Context, fHeader: FunctionHeader) {
+		this.count++;
 
-
-		const stmts = this.convertBlock(flow, context);
-		const withRegs = this.buildRegisters(context, stmts);
-		const block = ts.factory.createBlock(withRegs, true);
-		const fixed = this.applyFixups(block, context);
-		const blockWhile = this.combineIfDoWhile(fixed);
-		return blockWhile;
-	}
-
-	private convertBlock(block: Block, context: Context, until?: Block) {
-		if (context.blocksConversion.has(block)) {
-			return context.blocksConversion.get(block) as ts.Statement[];
+		if (this.count % 100 == 0) {
+			console.log(`${this.count}/${this.header.functionHeaders.length} (${100 * this.count / this.header.functionHeaders.length}%)`);
 		}
 
-		let stmts: ts.Statement[] = [];		
-		context.blocksConversion.set(block, stmts);
+		const controlflow = this.ctrlFlowBuilder.buildControlFlow(fHeader);
 
-		for (const instr of block.insts) {
-			const node: InstructionNode = {instr};
-			if (node.instr.opcode === 'CreateEnvironment') {
-				const expr = this.emit(node, context);
-				const fixup = context.fixups.get(expr)!;
-				context.fixups.delete(expr);
-				const dummy = ts.factory.createEmptyStatement();
-				stmts.push(dummy);
-				context.fixups.set(dummy, fixup);
-			} else {
-				const tsNode = this.emit(node, context);
+		for (let i = 0; i < fHeader.paramCount - 1; i++) {
+			ctx.params.push(ts.factory.createIdentifier('p' + i));
+		}
 
-				if (node.instr.opcode === 'Jmp' || node.instr.opcode === 'JmpLong') {
-					if (until != block.tLabel) {
-						stmts.push(...this.convertBlock(block.tLabel, context, until));
-					}
-					return stmts;
-				}
+		const bodyNode = this.decompileNodes(ctx, controlflow);
 
-				if (node.instr.opcode.startsWith('J')) {
-					const expr = tsNode as ts.Expression;
-					if (node.instr.operands[0].value < 0) {
-						stmts = [
-							ts.factory.createDoStatement(
-								ts.factory.createBlock(this.convertBlock(block.tLabel, context, block), true),
-								expr
-							)
-						];
-						context.blocksConversion.set(block, stmts);
-					} else if (node.instr.opcode.includes('Not')) {
-						if (!block.tLabel) { //TODO: This is invalid
-							return [ts.factory.createThrowStatement(ts.factory.createStringLiteral('Decompiler error'))];
-						}
-						const jmp = this.endsInJmp(block.fLabel, new Set(), block.tLabel.insts[0].ip);
-						if (jmp) {
-							stmts.push(ts.factory.createIfStatement(expr, 
-								ts.factory.createBlock(this.convertBlock(block.fLabel, context, jmp.tLabel), true),
-								ts.factory.createBlock(this.convertBlock(block.tLabel, context, jmp.tLabel), true)));
-							stmts.push(...this.convertBlock(jmp.tLabel, context, until));
-						} else {
-							stmts.push(ts.factory.createIfStatement(expr, 
-								ts.factory.createBlock(this.convertBlock(block.fLabel, context, block.tLabel), true)));
-							stmts.push(...this.convertBlock(block.tLabel, context, until));
-						}
-					} else {
-						if (!block.tLabel) { //TODO: This is invalid
-							return [ts.factory.createThrowStatement(ts.factory.createStringLiteral('Decompiler error'))];
-						}
-						const jmp = this.endsInJmp(block.fLabel, new Set(), block.tLabel.insts[0].ip);
-						if (jmp) {
-							stmts.push(ts.factory.createIfStatement(expr, 
-								ts.factory.createBlock(this.convertBlock(block.tLabel, context, jmp.tLabel), true),
-								ts.factory.createBlock(this.convertBlock(block.fLabel, context, jmp.tLabel), true)));
-							stmts.push(...this.convertBlock(jmp.tLabel, context, until));
-						} else {
-							stmts.push(ts.factory.createIfStatement(ts.factory.createLogicalNot(expr),
-								ts.factory.createBlock(this.convertBlock(block.fLabel, context, block.tLabel), true)));
-							stmts.push(...this.convertBlock(block.tLabel, context, until));
-						}
-					}
-				} else if (!ts.isVoidExpression(tsNode)) {
-					if (ts.isReturnStatement(tsNode) || ts.isEmptyStatement(tsNode)) {
-						stmts.push(tsNode);
-					} else {
-						stmts.push(ts.factory.createExpressionStatement(tsNode as ts.Expression));
-					}
-				}
+		const vars: ts.VariableDeclaration[] = [
+			ts.factory.createVariableDeclaration('flag'),
+			ts.factory.createVariableDeclaration('value'),
+		];
+
+		for (const reg of ctx.regs) {
+			if (reg) {
+				vars.push(ts.factory.createVariableDeclaration(reg));
 			}
 		}
 
-		if (!block.insts[block.insts.length - 1].opcode.startsWith('J') 
-		&& until != block.fLabel
-		&& block.insts[block.insts.length - 1].opcode !== 'Ret') {
-			stmts.push(...this.convertBlock(block.fLabel, context, until));
-		}
+		const body = ts.factory.createBlock([
+			ts.factory.createVariableStatement([], 
+				ts.factory.createVariableDeclarationList(vars)), 
+			bodyNode
+		], true);
 
-		return stmts;
+		const func = ts.factory.createFunctionExpression(
+			undefined, 
+			undefined, 
+			this.disassembler.getName(fHeader) || undefined,
+			undefined,
+			ctx.params.map(p => ts.factory.createParameterDeclaration(
+				undefined,
+				undefined,
+				undefined,
+				p
+			)),
+			undefined,
+			body);
+		const result = ts.transform(func, [
+			(context): ts.Transformer<ts.Node> => 
+				node => 
+					ts.visitNode(node, (function visit(this: Decompiler, node): ts.Node {
+						if (ts.isFunctionExpression(node) && node !== func) {
+							return node;
+						}
+
+						const env = ctx.envs.find(e => e.origin === node);
+						if (env) {
+							if (env.vars.length === 0) {
+								const result = ts.factory.createEmptyStatement();
+								ts.addSyntheticTrailingComment(result, ts.SyntaxKind.SingleLineCommentTrivia, 'Empty environment');
+								return result;
+							}
+
+							const vars: ts.VariableDeclaration[] = [];
+							for (const v of env.vars) {
+								if (v) {
+									vars.push(ts.factory.createVariableDeclaration(v));
+								}
+							}
+
+							return ts.factory.createVariableStatement(undefined, 
+								ts.factory.createVariableDeclarationList(vars));
+						}
+
+						return ts.visitEachChild(node, visit.bind(this), context);
+					} as ts.Visitor).bind(this))
+		]).transformed[0] as ts.FunctionExpression;
+
+		ts.addSyntheticLeadingComment(result, ts.SyntaxKind.MultiLineCommentTrivia, 'function ' + this.header.functionHeaders.indexOf(fHeader));
+		
+		// this.printTSNode(ts.factory.createExpressionStatement(result));
+		return result;
 	}
 
-	private emit(node: InstructionNode, context: Context) {
-		const r = this.convertInstruction(node, context);
-		context.nodeConversion.set(node, r);
-		return r;
+	private decompileNodes(ctx: Context, node: ControlflowNode) {
+		const topScope: Scope = {
+			parent: {} as Scope,
+			context: ctx,
+			envRegs: []
+		};
+		topScope.parent = topScope;
+
+		const key = ts.factory.createEmptyStatement();
+		ctx.queue.push([topScope, node, key]);
+
+		const visited = new Set<ControlflowNode>();
+		
+		while (ctx.queue.length > 0) {
+			const [scope, nextNode, scheduled] = ctx.queue.shift()!;
+
+			if (visited.has(nextNode)) {
+				continue;
+			}
+			visited.add(nextNode);
+
+			const result = this.decompileNode(scope, nextNode);
+			ctx.completed.set(scheduled, result);
+		}
+		
+		return ts.transform(ctx.completed.get(key)!, [
+			(context): ts.Transformer<ts.Node> => 
+				node => 
+					ts.visitNode(node, (function visit(this: Decompiler, node): ts.Node {
+						if (ctx.completed.has(node as ts.Statement)) {
+							node = ctx.completed.get(node as ts.Statement)!;
+						}
+	
+						return ts.visitEachChild(node, visit.bind(this), context);
+					} as ts.Visitor).bind(this)),
+			(context): ts.Transformer<ts.Node> => 
+				node => 
+					ts.visitNode(node, (function visit(this: Decompiler, node): ts.Node {
+						if (ts.isBlock(node)) {
+							node = ts.factory.updateBlock(node, node.statements.filter(s => !ts.isEmptyStatement(s)));
+						}
+			
+						return ts.visitEachChild(node, visit.bind(this), context);
+					} as ts.Visitor).bind(this))
+		]).transformed[0] as ts.Block | ts.Statement;
 	}
 
-	private endsInJmp(block: Block, visited: Set<Block>, ip: number): Block | undefined {
-		if (visited.has(block)) {
-			return;
-		}
-		visited.add(block);
+	private schedule(scope: Scope, node: ControlflowNode): ts.Statement {
+		return this.decompileNode(
+			{parent: scope, context: scope.context, envRegs: []},
+			node,
+		);
+		const result = ts.factory.createExpressionStatement(ts.factory.createUniqueName('scheduled'));
 
-		if (!block) { //TODO: This should never happen
-			return;
-		}
+		scope.context.queue.push([
+			{parent: scope, context: scope.context, envRegs: []},
+			node,
+			result
+		]);
 
-		if (block.insts[block.insts.length - 1].opcode === 'Jmp' && block.fLabel.insts[0].ip === ip) {
-			return block;
-		}
-
-		if (block.insts.some(i => i.opcode === 'Ret')) {
-			return;
-		}
-
-		const resultT = this.endsInJmp(block.tLabel, visited, ip);
-		if (resultT) {
-			return resultT;
-		}
-
-		if (block.insts[block.insts.length - 1].opcode === 'Jmp') {
-			return this.endsInJmp(block.fLabel, visited, ip);
-		}
+		return result;
 	}
 
-	private convertInstruction(node: InstructionNode, ctx: Context) : ts.Node {
-		if (ctx.nodeConversion.has(node)) {
-			return ctx.nodeConversion.get(node)!;
+	private decompileNode(scope: Scope, node: ControlflowNode): ts.Block | ts.Statement {
+		switch (node.type) {
+		case 'c': {
+			const code = this.decompileBlock(scope.context, scope, node.code);
+			if (node.isLoop) {
+				if (node.after) {
+					return ts.factory.createBlock([
+						...code.statements,
+						this.schedule(scope, node.after)!
+					], true);
+				} else {
+					return code;
+				}
+			}
+
+			const ifNode = node.then.type !== 'r' || !node.then.empty 
+				? ts.factory.createIfStatement(
+					ts.factory.createLogicalNot(
+						ts.factory.createIdentifier('flag')
+					),
+					this.schedule(scope, node.else)!,
+					this.schedule(scope, node.then)!
+				)
+				: ts.factory.createIfStatement(
+					ts.factory.createLogicalNot(
+						ts.factory.createIdentifier('flag')
+					),
+					this.schedule(scope, node.else)!
+				);
+			
+				
+			if (node.after) {
+				return ts.factory.createBlock([
+					...code.statements,
+					ifNode,
+					this.schedule(scope, node.after)!
+				], true);
+			} else {
+				return ts.factory.createBlock([
+					...code.statements,
+					ifNode
+				], true);
+			}
+		}
+		case 'j': {
+			const code = this.decompileBlock(scope.context, scope, node.code);
+			const last = node.code.insts[node.code.insts.length - 1];
+			if (last.opcode !== 'Ret' && !node.isLoop) {
+				const target = this.schedule(scope, node.target)!;
+
+				return ts.factory.createBlock([
+					...code.statements,
+					...(ts.isBlock(target) ? target.statements : [target])
+				], true);
+			}
+			return ts.factory.createBlock([
+				...code.statements,
+			], true);
+		}
+		case 'r': {
+			if (!node.empty) {
+				return ts.factory.createReturnStatement();
+			}
+			return ts.factory.createEmptyStatement();
+		}
+		case 's': {
+			const code = this.decompileBlock(scope.context, scope, node.code);
+			const clauses: ts.CaseClause[] = [];
+
+			const last = node.code.insts[node.code.insts.length - 1];
+			const start = last.operands[3].value as number;
+			const end = last.operands[4].value as number;
+			const count = end - start + 1;
+			for (let i = 0; i < count; i++) {
+				const block = node.blocks[i];
+				const clause = ts.factory.createCaseClause(
+					ts.factory.createNumericLiteral(i + start),
+					[
+						this.schedule(scope, block)!,
+						ts.factory.createBreakStatement(),
+					]
+				);
+
+				clauses.push(clause);
+			}
+
+			clauses.push(
+				ts.factory.createDefaultClause(
+					[
+						this.schedule(scope, node.default)!,
+						ts.factory.createBreakStatement(),
+					]
+				) as unknown as ts.CaseClause
+			);
+
+			const switchNode = ts.factory.createSwitchStatement(
+				ts.factory.createIdentifier('value'),
+				ts.factory.createCaseBlock(
+					clauses
+				)
+			);
+
+			const after = node.after ? this.schedule(scope, node.after)! : ts.factory.createEmptyStatement();
+
+			return ts.factory.createBlock([
+				...code.statements,
+				switchNode,
+				after,
+			], true);
+		}
+		case 'l': {
+			return ts.factory.createBlock([
+				ts.factory.createDoStatement(
+					this.schedule(scope, node.body)!,
+					ts.factory.createIdentifier('flag')
+				),
+				this.schedule(scope, node.after)!
+			], true);
+		}
 		}
 
-		let left: ts.Expression;
+	}
 
-		switch (node.instr.opcode) {
+	private decompileBlock(ctx: Context, scope: Scope, block: CodeBlock) {
+		const stmts: ts.Statement[] = [];
+		for (const inst of block.insts) {
+			const node = this.decompileInstruction(ctx, scope, inst);
+			if (!ts.isEmptyStatement(node)) {
+				stmts.push(node);
+			}
+		}
+		return ts.factory.createBlock(stmts, true);
+	}
+
+	private decompileInstruction(ctx: Context, scope: Scope, inst: Instruction): ts.Statement {
+		switch (inst.opcode) {
+		//Load const
 		case 'LoadConstString':
 		case 'LoadConstStringLongIndex': //TODO: check
-			return this.assign(ctx, node, 0, 
-				ts.factory.createStringLiteral(node.instr.operands[1].value as string));
+			return this.assign(ctx, inst,
+				ts.factory.createStringLiteral(inst.operands[1].value as string));
 		case 'LoadConstZero':
-			return this.assign(ctx, node, 0, 
+			return this.assign(ctx, inst,  
 				ts.factory.createNumericLiteral(0));
 		case 'LoadConstUndefined':
-			return this.assign(ctx, node, 0, 
+			return this.assign(ctx, inst,  
 				ts.factory.createIdentifier('undefined'));
 		case 'LoadConstNull':
-			return this.assign(ctx, node, 0, 
+			return this.assign(ctx, inst,  
 				ts.factory.createNull());
 		case 'LoadConstFalse':
-			return this.assign(ctx, node, 0, 
+			return this.assign(ctx, inst,  
 				ts.factory.createFalse());
 		case 'LoadConstTrue':
-			return this.assign(ctx, node, 0, 
+			return this.assign(ctx, inst,  
 				ts.factory.createTrue());
 		case 'LoadConstUInt8':
 		case 'LoadConstInt':
 		case 'LoadConstDouble':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createNumericLiteral(node.instr.operands[1].value as number));
-		case 'LoadParam':
-			return this.assign(ctx, node, 0, 
-				ctx.params[node.instr.operands[1].value as number]);
-		case 'NewObject':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createObjectLiteralExpression());
-		case 'GetGlobalObject':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createIdentifier('globalThis'));
-		case 'TypeOf':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createTypeOfExpression(this.toIdentifier(ctx, node, 1)));
-		case 'JmpTrue':
-		case 'JmpTrueLong': //TODO: check
-			return this.toIdentifier(ctx, node, 1); //TODO: check
-		case 'JmpFalse':
-		case 'JmpFalseLong': //TODO: check
-			return ts.factory.createPrefixUnaryExpression(ts.SyntaxKind.ExclamationToken, this.toIdentifier(ctx, node, 1)); //TODO: check
-		case 'JLess':
-		case 'JLessN': //TODO: check
-		case 'JLessLong': //TODO: check
-		case 'JLessNLong': //TODO: check
-		case 'JNotLess':
-		case 'JNotLessN': //TODO: check
-		case 'JNotLessLong': //TODO: check
-		case 'JNotLessNLong': //TODO: check
-			return ts.factory.createLessThan(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2));
-		case 'JLessEqual':
-		case 'JLessEqualN': //TODO: check
-		case 'JLessEqualLong': //TODO: check
-		case 'JLessEqualNLong': //TODO: check
-		case 'JNotLessEqual':
-		case 'JNotLessEqualN': //TODO: check
-		case 'JNotLessEqualLong': //TODO: check
-		case 'JNotLessEqualNLong': //TODO: check
-			return ts.factory.createLessThanEquals(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2));
-		case 'JGreater':
-		case 'JGreaterN': //TODO: check
-		case 'JGreaterNLong': //TODO: check
-		case 'JGreaterLong': //TODO: check
-		case 'JNotGreater':
-		case 'JNotGreaterN': //TODO: check
-		case 'JNotGreaterLong': //TODO: check
-		case 'JNotGreaterNLong': //TODO: check
-			return ts.factory.createGreaterThan(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2));
-		case 'JGreaterEqual':
-		case 'JGreaterEqualN': //TODO: check
-		case 'JGreaterEqualNLong': //TODO: check
-		case 'JGreaterEqualLong': //TODO: check
-		case 'JNotGreaterEqual':
-		case 'JNotGreaterEqualN': //TODO: check
-		case 'JNotGreaterEqualLong': //TODO: check
-		case 'JNotGreaterEqualNLong': //TODO: check
-			return ts.factory.createGreaterThanEquals(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2));
-		case 'JEqual':
-		case 'JEqualLong': //TODO: check
-		case 'JNotEqual':
-		case 'JNotEqualLong': //TODO: check
-			return ts.factory.createEquality(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2));
-		case 'JStrictEqual':
-		case 'JStrictEqualLong': //TODO: check
-			return ts.factory.createStrictEquality(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2));
-		case 'JStrictNotEqual':
-		case 'JStrictNotEqualLong': //TODO: check
-			return ts.factory.createStrictEquality(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2));
-		case 'JmpUndefined':
-		case 'JmpUndefinedLong': //TODO: check
-			return ts.factory.createEquality(this.toIdentifier(ctx, node, 1), ts.factory.createIdentifier('undefined'));
-		case 'TryGetById':
-			left = this.toIdentifier(ctx, node, 1);
-			if (ts.isIdentifier(left) && left.text === 'globalThis') {
-				return this.assign(ctx, node, 0, 
-					ts.factory.createIdentifier(node.instr.operands[3].value as string));
-			}
-
-			return this.assign(ctx, node, 0, 
-				ts.factory.createPropertyAccessExpression(left, node.instr.operands[3].value as string));
-		case 'GetById':
-			left = this.toIdentifier(ctx, node, 1);
-			if (ts.isIdentifier(left) && left.text === 'globalThis') {
-				return this.assign(ctx, node, 0, 
-					ts.factory.createIdentifier(node.instr.operands[3].value as string));
-			}
-
-			return ts.factory.createPropertyAccessExpression(left, node.instr.operands[3].value as string);
-		case 'GetByIdShort':
-			left = this.toIdentifier(ctx, node, 1);
-			if (ts.isIdentifier(left) && left.text === 'globalThis') {
-				return this.assign(ctx, node, 0, 
-					ts.factory.createIdentifier(node.instr.operands[3].value as string));
-			}
-
-			return this.assign(ctx, node, 0, 
-				ts.factory.createPropertyAccessExpression(left, node.instr.operands[3].value as string));
-		case 'Call':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createCallExpression(
-					ts.factory.createPropertyAccessExpression(this.toIdentifier(ctx, node, 1), 'call'), 
-					undefined, 
-					[])); //TODO: arguments
-		case 'Call1':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createCallExpression(
-					ts.factory.createPropertyAccessExpression(this.toIdentifier(ctx, node, 1), 'call'), 
-					undefined, 
-					[this.toIdentifier(ctx, node, 2)]));
-		case 'Call2':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createCallExpression(
-					ts.factory.createPropertyAccessExpression(this.toIdentifier(ctx, node, 1), 'call'), 
-					undefined, 
-					[this.toIdentifier(ctx, node, 2), this.toIdentifier(ctx, node, 3)]));
-		case 'Call3':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createCallExpression(
-					ts.factory.createPropertyAccessExpression(this.toIdentifier(ctx, node, 1), 'call'), 
-					undefined, 
-					[
-						this.toIdentifier(ctx, node, 2), 
-						this.toIdentifier(ctx, node, 3), 
-						this.toIdentifier(ctx, node, 4)]));
-		case 'Call4':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createCallExpression(
-					ts.factory.createPropertyAccessExpression(this.toIdentifier(ctx, node, 1), 'call'), 
-					undefined, 
-					[
-						this.toIdentifier(ctx, node, 2), 
-						this.toIdentifier(ctx, node, 3), 
-						this.toIdentifier(ctx, node, 4), 
-						this.toIdentifier(ctx, node, 5)]));
-		case 'AddN':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createAdd(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'Add':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createAdd(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'SubN':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createSubtract(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'Sub':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createSubtract(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'MulN':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createMultiply(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'Mul':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createMultiply(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'DivN':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createDivide(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'Div':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createDivide(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'Mod':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createModulo(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'URshift':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createUnsignedRightShift(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'LShift':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createLeftShift(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'RShift':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createRightShift(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'BitAnd':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createBitwiseAnd(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'BitOr':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createBitwiseOr(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'BitXor':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createBitwiseXor(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'StrictEq':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createStrictEquality(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'StrictNeq':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createStrictInequality(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'Eq':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createEquality(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'Neq':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createInequality(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'Greater':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createGreaterThan(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'GreaterEq':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createGreaterThanEquals(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'Less':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createLessThan(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'LessEq':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createLessThanEquals(this.toIdentifier(ctx, node, 1), this.toIdentifier(ctx, node, 2)));
-		case 'Not':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createPrefixUnaryExpression(ts.SyntaxKind.ExclamationToken, this.toIdentifier(ctx, node, 1)));
-		case 'BitNot':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createPrefixUnaryExpression(ts.SyntaxKind.TildeToken, this.toIdentifier(ctx, node, 1)));
+			return this.assign(ctx, inst,
+				ts.factory.createNumericLiteral(inst.operands[1].value as number));
+						
+		//Unconditional
 		case 'Jmp':
-		case 'JmpLong': //TODO: check
-			return ts.factory.createVoidZero();
-		case 'Ret':
-			left = this.toIdentifier(ctx, node, 0);
-			return ts.factory.createReturnStatement(left) as unknown as ts.Expression;
-		case 'Mov':
-		case 'MovLong': //TODO: check
-			return this.assign(ctx, node, 0, 
-				this.toIdentifier(ctx, node, 1));
-		case 'LoadThisNS':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createThis());
-		case 'DeclareGlobalVar':
-			return ts.factory.createVoidZero();
-		case 'CreateEnvironment': {
-			const dummyExpression = ts.factory.createVoidZero();
-			const env: Environment = {
-				parent: ctx.environment,
-				variables: []
-			};
-			ctx.fixups.set(dummyExpression, () => env.variables.map(
-				v => v ? ts.factory.createVariableStatement(undefined, [
-					ts.factory.createVariableDeclaration(v)
-				]) : ts.factory.createEmptyStatement()
-			));
-			ctx.environments.set(this.toIdentifier(ctx, node, 0), env);
-			return dummyExpression;
-		}
-		case 'GetEnvironment': {
-			const count = node.instr.operands[1].value as number;
-			let result = ctx.environment;
-			for (let i = 0; i < count; i++) {
-				result = result.parent;
-			}
-			
-			ctx.environments.set(this.toIdentifier(ctx, node, 0), result);
+		case 'JmpLong':
 			return ts.factory.createEmptyStatement();
-		}
-		case 'StoreToEnvironment':
-		case 'StoreNPToEnvironment': //TODO: 
-		case 'StoreToEnvironmentL': //TODO: 
-		case 'StoreNPToEnvironmentL': //TODO: 
-		{
-			const dummyExpression = this.toIdentifier(ctx, node, 0);
-			const index = node.instr.operands[1].value as number;
-			const value = this.toIdentifier(ctx, node, 2);
+		case 'Ret':
+			return ts.factory.createReturnStatement(this.getRegister(ctx, inst.operands[0].value as number));
+	
+		//Conditional
+		case 'JEqual':
+		case 'JEqualLong':
+			return this.condition(ts.factory.createEquality(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JGreater':
+		case 'JGreaterLong':
+		case 'JGreaterN':
+		case 'JGreaterNLong':
+			return this.condition(ts.factory.createGreaterThan(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JGreaterEqual':
+		case 'JGreaterEqualLong':
+		case 'JGreaterEqualN':
+		case 'JGreaterEqualNLong':
+			return this.condition(ts.factory.createGreaterThanEquals(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JLess':
+		case 'JLessEqual':
+		case 'JLessLong':
+		case 'JLessN':
+		case 'JLessNLong':
+			return this.condition(ts.factory.createLessThan(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JLessEqualLong':
+		case 'JLessEqualN':
+		case 'JLessEqualNLong':
+			return this.condition(ts.factory.createLessThanEquals(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JStrictEqual':
+		case 'JStrictEqualLong':
+			return this.condition(ts.factory.createStrictEquality(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JNotEqual':
+		case 'JNotEqualLong':
+			return this.condition(ts.factory.createInequality(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JNotGreater':
+		case 'JNotGreaterLong':
+		case 'JNotGreaterN':
+		case 'JNotGreaterNLong':
+			return this.conditionNot(ts.factory.createGreaterThan(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JNotGreaterEqual':
+		case 'JNotGreaterEqualLong':
+		case 'JNotGreaterEqualN':
+		case 'JNotGreaterEqualNLong':
+			return this.conditionNot(ts.factory.createGreaterThanEquals(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JNotLess':
+		case 'JNotLessLong':
+		case 'JNotLessN':
+		case 'JNotLessNLong':
+			return this.conditionNot(ts.factory.createLessThan(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JNotLessEqual':
+		case 'JNotLessEqualLong':
+		case 'JNotLessEqualN':
+		case 'JNotLessEqualNLong':
+			return this.conditionNot(ts.factory.createLessThanEquals(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JStrictNotEqual':
+		case 'JStrictNotEqualLong':
+			return this.condition(ts.factory.createStrictInequality(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				this.getRegister(ctx, inst.operands[2].value as number),
+			));
+		case 'JmpFalse':
+		case 'JmpFalseLong':
+			return this.conditionNot(
+				this.getRegister(ctx, inst.operands[1].value as number)
+			);
+		case 'JmpTrue':
+		case 'JmpTrueLong':
+			return this.condition(
+				this.getRegister(ctx, inst.operands[1].value as number)
+			);
+		case 'JmpUndefined':
+		case 'JmpUndefinedLong':
+			return this.condition(ts.factory.createStrictEquality(
+				this.getRegister(ctx, inst.operands[1].value as number),
+				ts.factory.createVoidZero(),
+			));
+		case 'SwitchImm':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					ts.factory.createIdentifier('value'),
+					this.getRegister(ctx, inst.operands[0].value as number)
+				)
+			);
 
-			const env = ctx.environments.get(dummyExpression);
-			if (!env) {
-				throw new Error('Invalid environment in StoreToEnvironment arg 0');
-			}
-
-			const ident = this.getEnvVariable(env, index);
-
-			return ts.factory.createAssignment(ident, value); 
-		}
-		case 'LoadFromEnvironment':
-		case 'LoadFromEnvironmentL':
-		{
-			const dummyExpression = this.toIdentifier(ctx, node, 1);
-			const index = node.instr.operands[2].value as number;
-
-			const env = ctx.environments.get(dummyExpression);
-			if (!env) {
-				throw new Error('Invalid environment in LoadFromEnvironment arg 1');
-			}
-
-			return this.assign(ctx, node, 0, this.getEnvVariable(env, index)); 
-		}
-		case 'TryPutById':
+		//Calls
+		case 'Call1':
+			return this.assign(ctx, inst,
+				ts.factory.createCallExpression(
+					ts.factory.createPropertyAccessExpression(
+						this.getRegister(ctx, inst.operands[1].value as number),
+						'call'
+					),
+					undefined,
+					[
+						this.getRegister(ctx, inst.operands[2].value as number),
+					]
+				)
+			);
+		case 'Call2':
+			return this.assign(ctx, inst,
+				ts.factory.createCallExpression(
+					ts.factory.createPropertyAccessExpression(
+						this.getRegister(ctx, inst.operands[1].value as number),
+						'call'
+					),
+					undefined,
+					[
+						this.getRegister(ctx, inst.operands[2].value as number),
+						this.getRegister(ctx, inst.operands[3].value as number),
+					]
+				)
+			);
+		case 'Call3':
+			return this.assign(ctx, inst,
+				ts.factory.createCallExpression(
+					ts.factory.createPropertyAccessExpression(
+						this.getRegister(ctx, inst.operands[1].value as number),
+						'call'
+					),
+					undefined,
+					[
+						this.getRegister(ctx, inst.operands[2].value as number),
+						this.getRegister(ctx, inst.operands[3].value as number),
+						this.getRegister(ctx, inst.operands[4].value as number),
+					]
+				)
+			);
+		case 'Call4':
+			return this.assign(ctx, inst,
+				ts.factory.createCallExpression(
+					ts.factory.createPropertyAccessExpression(
+						this.getRegister(ctx, inst.operands[1].value as number),
+						'call'
+					),
+					undefined,
+					[
+						this.getRegister(ctx, inst.operands[2].value as number),
+						this.getRegister(ctx, inst.operands[3].value as number),
+						this.getRegister(ctx, inst.operands[4].value as number),
+						this.getRegister(ctx, inst.operands[5].value as number),
+					]
+				)
+			);
+			
+		//Accessors
 		case 'PutById':
-			left = this.toIdentifier(ctx, node, 0);
-			if (ts.isIdentifier(left) && left.text === 'globalThis') {
-				return ts.factory.createAssignment(
-					ts.factory.createIdentifier(node.instr.operands[3].value as string), 
-					this.toIdentifier(ctx, node, 1));
-			}
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					ts.factory.createPropertyAccessExpression(
+						this.getRegister(ctx, inst.operands[0].value as number),
+						inst.operands[3].value as string
+					),
+					this.getRegister(ctx, inst.operands[1].value as number)
+				)
+			);
+		case 'PutNewOwnById':
+		case 'PutNewOwnByIdLong':
+		case 'PutNewOwnByIdShort':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					ts.factory.createPropertyAccessExpression(
+						this.getRegister(ctx, inst.operands[0].value as number),
+							inst.operands[2].value as string
+					),
+					this.getRegister(ctx, inst.operands[1].value as number)
+				)
+			);
+		case 'GetById':
+		case 'TryGetById':
+		case 'GetByIdShort':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					this.getRegister(ctx, inst.operands[0].value as number),
+					ts.factory.createPropertyAccessExpression(
+						this.getRegister(ctx, inst.operands[1].value as number),
+						inst.operands[3].value as string
+					),
+				)
+			);
+			
+		case 'PutOwnByIndex':
+		case 'PutOwnByIndexL':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					ts.factory.createElementAccessExpression(
+						this.getRegister(ctx, 0),
+						inst.operands[2].value as number
+					),
+					this.getRegister(ctx, 1),
+				)
+			);
+		case 'PutByVal':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					ts.factory.createElementAccessExpression(
+						this.getRegister(ctx, inst.operands[0].value as number),
+						this.getRegister(ctx, inst.operands[1].value as number)
+					),
+					this.getRegister(ctx, inst.operands[2].value as number)
+				)
+			);
+		case 'GetByVal':
+			return this.assign(ctx, inst,
+				ts.factory.createElementAccessExpression(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
 
-			return ts.factory.createAssignment(
-				ts.factory.createPropertyAccessExpression(
-					left,
-					node.instr.operands[3].value as string
-				), this.toIdentifier(ctx, node, 1));
-		case 'CreateClosure':
-			left = this.toIdentifier(ctx, node, 1);
-			return this.assign(ctx, node, 0, this.createClosure(left, node.instr.operands[2].value as number, ctx));
-		case 'ToNumber':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createCallExpression(ts.factory.createIdentifier('Number'), undefined, [this.toIdentifier(ctx, node, 1)]));
-		case 'CallBuiltin':
-			//TODO
-			return ts.factory.createCallExpression(ts.factory.createIdentifier(node.instr.operands[1].value as string), undefined, []);
+		//Create
+		case 'NewObject':
+			return this.assign(ctx, inst, 
+				ts.factory.createObjectLiteralExpression());
 		case 'NewObjectWithBuffer':
-		case 'NewObjectWithBufferLong':
-		{
-			//const preallocationSizeHint = node.instr.operands[1].value as number;
-			const staticElements = node.instr.operands[2].value as number;
-			const keyIndex = node.instr.operands[3].value as number;
-			const valueIndex = node.instr.operands[4].value as number;
-
+		case 'NewObjectWithBufferLong': {
+			//const preallocationSizeHint = inst.operands[1].value as number;
+			const staticElements = inst.operands[2].value as number;
+			const keyIndex = inst.operands[3].value as number;
+			const valueIndex = inst.operands[4].value as number;
+	
 			const properties: ts.ObjectLiteralElementLike[] = [];
 			for (let i = 0; i < staticElements; i++) {
+				if (this.header.objValueValues[valueIndex + i] === undefined) {
+					return ts.factory.createThrowStatement(
+						ts.factory.createNewExpression(
+							ts.factory.createIdentifier('Error'),
+							undefined,
+							[ts.factory.createStringLiteral('Decompiler error: NewObjectWithBufferLong overflow')]
+						)
+					);
+				}
 				properties.push(ts.factory.createPropertyAssignment('' + this.header.objKeyValues[keyIndex + i], 
 					this.toLiteral(this.header.objValueValues[valueIndex + i])));
 			}
 
-			return ts.factory.createAssignment(
-				this.toIdentifier(ctx, node, 0),
+			return this.assign(ctx, inst, 
 				ts.factory.createObjectLiteralExpression(properties, staticElements > 1)
-			); 
+			);
 		}
 		case 'NewArrayWithBuffer':
-		case 'NewArrayWithBufferLong':
-		{
-			//const preallocationSizeHint = node.instr.operands[1].value as number;
-			const staticElements = node.instr.operands[2].value as number;
-			const index = node.instr.operands[3].value as number;
-
+		case 'NewArrayWithBufferLong': {
+			//const preallocationSizeHint = inst.operands[1].value as number;
+			const staticElements = inst.operands[2].value as number;
+			const index = inst.operands[3].value as number;
+	
 			const elements: ts.Expression[] = [];
 			for (let i = 0; i < staticElements; i++) {
+				if (this.header.arrayValues[index + i] === undefined) {
+					return ts.factory.createThrowStatement(
+						ts.factory.createNewExpression(
+							ts.factory.createIdentifier('Error'),
+							undefined,
+							[ts.factory.createStringLiteral('Decompiler error: NewArrayWithBufferLong overflow')]
+						)
+					);
+				}
 				elements.push(this.toLiteral(this.header.arrayValues[index + i]));
 			}
-
-			return ts.factory.createAssignment(
-				this.toIdentifier(ctx, node, 0),
+	
+			return this.assign(ctx, inst, 
 				ts.factory.createArrayLiteralExpression(elements)
 			);
 		}
 		case 'NewArray':
-			return ts.factory.createAssignment(
-				this.toIdentifier(ctx, node, 0),
-				ts.factory.createArrayLiteralExpression()
-			);
-		case 'PutOwnByIndex':
-			return ts.factory.createAssignment(
-				ts.factory.createElementAccessExpression(
-					this.toIdentifier(ctx, node, 0),
-					node.instr.operands[2].value as number
-				),
-				this.toIdentifier(ctx, node, 1),
-			);
-		case 'PutByVal':
-			return ts.factory.createAssignment(
-				ts.factory.createElementAccessExpression(
-					this.toIdentifier(ctx, node, 0),
-					this.toIdentifier(ctx, node, 1)
-				),
-				this.toIdentifier(ctx, node, 2),
-			);
-		case 'GetByVal':
-			return ts.factory.createAssignment(
-				this.toIdentifier(ctx, node, 0),
-				ts.factory.createElementAccessExpression(
-					this.toIdentifier(ctx, node, 1),
-					this.toIdentifier(ctx, node, 2)
+			return this.assign(ctx, inst, ts.factory.createArrayLiteralExpression());
+
+		//Other
+		case 'DelById':
+			return this.assign(ctx, inst,
+				ts.factory.createDeleteExpression(
+					ts.factory.createPropertyAccessExpression(
+						this.getRegister(ctx, inst.operands[1].value as number),
+						inst.operands[2].value as string
+					)
 				)
 			);
-		case 'CreateThis':
-			return ts.factory.createEmptyStatement(); //TODO: this instruction is followed by mov instructions that pass the arguments for Construct.
-		case 'Construct':
-			return ts.factory.createAssignment(
-				this.toIdentifier(ctx, node, 0),
-				ts.factory.createNewExpression(this.toIdentifier(ctx, node, 1), undefined, []) //TODO: arguments
+			
+		case 'DelByVal':
+			return this.assign(ctx, inst,
+				ts.factory.createDeleteExpression(
+					ts.factory.createElementAccessExpression(
+						this.getRegister(ctx, inst.operands[1].value as number),
+						this.getRegister(ctx, inst.operands[2].value as number)
+					)
+				)
 			);
-		case 'Throw':
-			return ts.factory.createEmptyStatement();//TODO: return ts.factory.createThrowStatement(this.toIdentifier(ctx, node, 0));
-		case 'AddEmptyString':
-			return this.assign(ctx, node, 0, ts.factory.createAdd(ts.factory.createStringLiteral(''), this.toIdentifier(ctx, node, 1)));
-		case 'ToInt32':
-			return this.assign(ctx, node, 0, ts.factory.createBitwiseOr(this.toIdentifier(ctx, node, 1), ts.factory.createNumericLiteral(0)));
-		case 'Negate':
-			return this.assign(ctx, node, 0, ts.factory.createPrefixMinus(this.toIdentifier(ctx, node, 1)));
-		case 'IsIn':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createBinaryExpression(
-					this.toIdentifier(ctx, node, 1),
-					ts.SyntaxKind.InKeyword,
-					this.toIdentifier(ctx, node, 2),
-				));
-		case 'InstanceOf':
-			return this.assign(ctx, node, 0, 
-				ts.factory.createBinaryExpression(
-					this.toIdentifier(ctx, node, 1),
-					ts.SyntaxKind.InstanceOfKeyword,
-					this.toIdentifier(ctx, node, 2),
-				)); //TODO: Figure out "Note that this is not the same as JS instanceof."
-		case 'SelectObject':
-			return ts.factory.createEmptyStatement(); //TODO: Figure this out
-			/*
-			return ts.factory.createAssignment(
-				this.toIdentifier(ctx, node, 0),
-				ts.factory.createConditionalExpression(
-					ts.factory.createBinaryExpression(
-						this.toIdentifier(ctx, node, 2),
-						ts.SyntaxKind.InstanceOfKeyword,
-						ts.factory.createIdentifier('Object')
+
+		case 'PutOwnGetterSetterByVal':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createCallExpression(
+					ts.factory.createPropertyAccessExpression(
+						ts.factory.createIdentifier('Object'),
+						'defineProperty'
 					),
 					undefined,
-					this.toIdentifier(ctx, node, 2),
-					undefined,
-					this.toIdentifier(ctx, node, 1)
+					[
+						this.getRegister(ctx, 0),
+						this.getRegister(ctx, 1),
+						ts.factory.createObjectLiteralExpression([
+							ts.factory.createPropertyAssignment('get', this.getRegister(ctx, 2)),
+							ts.factory.createPropertyAssignment('set', this.getRegister(ctx, 3)),
+						])
+					]
 				)
-			);*/
-		case 'Catch':
-			return ts.factory.createEmptyStatement(); //TODO: 
+			);
+
+		case 'Throw':
+			return ts.factory.createThrowStatement(this.getRegister(ctx, 0));
+		case 'TypeOf':
+			return this.assign(ctx, inst, 
+				ts.factory.createTypeOfExpression(this.getRegister(ctx, 1)));
+		case 'IsIn':
+			return this.assign(ctx, inst,
+				ts.factory.createBinaryExpression(
+					this.getRegister(ctx, 1),
+					ts.SyntaxKind.InKeyword,
+					this.getRegister(ctx, 2),
+				));
+		case 'InstanceOf': {
+			const result = this.assign(ctx, inst, 
+				ts.factory.createBinaryExpression(
+					this.getRegister(ctx, 1),
+					ts.SyntaxKind.InstanceOfKeyword,
+					this.getRegister(ctx, 2),
+				)); //TODO: Figure out "Note that this is not the same as JS instanceof."
+
+			return ts.addSyntheticTrailingComment(result, ts.SyntaxKind.SingleLineCommentTrivia, 'Note that this is not the same as JS instanceof');
+		}
+		case 'ToNumber':
+			return this.assign(ctx, inst, 
+				ts.factory.createCallExpression(ts.factory.createIdentifier('Number'), undefined, [this.getRegister(ctx, 1)]));
+		case 'AddEmptyString':
+			return this.assign(ctx, inst, ts.factory.createAdd(ts.factory.createStringLiteral(''), this.getRegister(ctx, 1)));
+		case 'ToInt32':
+			return this.assign(ctx, inst, ts.factory.createBitwiseOr(this.getRegister(ctx, 1), ts.factory.createNumericLiteral(0)));
+
 		case 'GetPNameList':
-			return this.assign(ctx, node, 0, ts.factory.createConditionalExpression(
-				this.toIdentifier(ctx, node, 1),
+			return this.assign(ctx, inst, ts.factory.createConditionalExpression(
+				this.getRegister(ctx, 1),
 				undefined,
 				ts.factory.createCallExpression(
 					ts.factory.createPropertyAccessExpression(
 						ts.factory.createCallExpression(
 							ts.factory.createPropertyAccessExpression(ts.factory.createIdentifier('Object'), 'keys'), 
 							undefined,
-							[this.toIdentifier(ctx, node, 1)]),
+							[this.getRegister(ctx, 1)]),
 						'slice'
 					),
 					undefined,
-					[this.toIdentifier(ctx, node, 2)]
+					[this.getRegister(ctx, 2)]
 				)
 				,
 				undefined,
 				ts.factory.createArrayLiteralExpression()
 			)); //TODO:
 		case 'GetNextPName':
-			return this.assign(ctx, node, 0, ts.factory.createElementAccessExpression(
-				this.toIdentifier(ctx, node, 1),
-				this.toIdentifier(ctx, node, 2)
+			return this.assign(ctx, inst, ts.factory.createElementAccessExpression(
+				this.getRegister(ctx, 1),
+				this.getRegister(ctx, 2)
 			)); //TODO:
 		case 'GetArgumentsLength':
-			return this.assign(ctx, node, 0, ts.factory.createPropertyAccessExpression(
+			return this.assign(ctx, inst, ts.factory.createPropertyAccessExpression(
 				ts.factory.createIdentifier('arguments'),
 				'length'
 			)); //TODO: 
 		case 'GetArgumentsPropByVal':
-			return this.assign(ctx, node, 0, ts.factory.createElementAccessExpression(
+			return this.assign(ctx, inst, ts.factory.createElementAccessExpression(
 				ts.factory.createIdentifier('arguments'),
-				this.toIdentifier(ctx, node, 1)
+				this.getRegister(ctx, 1)
 			)); //TODO: 
 		case 'ReifyArguments':
-			return this.assign(ctx, node, 0, ts.factory.createIdentifier('arguments')); //TODO: 
-		case 'PutNewOwnById':
-		case 'PutNewOwnByIdShort':
-		case 'PutOwnByIndexL':
-		case 'DelById':
-		case 'DelByVal':
-		case 'PutOwnGetterSetterByVal':
-		case 'CreateRegExp':
-		case 'SwitchImm':
-		case 'NewObjectWithParent':
-			return ts.factory.createEmptyStatement(); //TODO: not implemented
-		default:
-			throw new Error('Opcode conversion not implemented: ' + node.instr.opcode);
+			return this.assign(ctx, inst, ts.factory.createIdentifier('arguments')); //TODO: 
+		
+		case 'SelectObject':
+			return this.assign(ctx, inst, 
+				ts.factory.createConditionalExpression(
+					ts.factory.createBinaryExpression(
+						this.getRegister(ctx, 2),
+						ts.SyntaxKind.InstanceOfKeyword,
+						ts.factory.createIdentifier('Object')
+					),
+					undefined,
+					this.getRegister(ctx, 2),
+					undefined,
+					this.getRegister(ctx, 1)
+				)
+			);
+
+		case 'LoadThisNS':
+			return this.assign(ctx, inst, ts.factory.createThis());
+
+		case 'DeclareGlobalVar':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					ts.factory.createPropertyAccessExpression(
+						ts.factory.createIdentifier('globalThis'),
+						inst.operands[0].value as string
+					),
+					ts.factory.createVoidZero()
+				)
+			);
+		case 'GetGlobalObject':
+			return this.assign(ctx, inst,
+				ts.factory.createIdentifier('globalThis'));
+		case 'Mov':
+		case 'MovLong':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					this.getRegister(ctx, inst.operands[0].value as number),
+					this.getRegister(ctx, inst.operands[1].value as number),
+				)
+			);
+		case 'Add':
+		case 'AddN':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					this.getRegister(ctx, inst.operands[0].value as number),
+					ts.factory.createAdd(
+						this.getRegister(ctx, inst.operands[1].value as number),
+						this.getRegister(ctx, inst.operands[2].value as number),
+					)
+				)
+			);
+		case 'Sub':
+		case 'SubN':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					this.getRegister(ctx, inst.operands[0].value as number),
+					ts.factory.createSubtract(
+						this.getRegister(ctx, inst.operands[1].value as number),
+						this.getRegister(ctx, inst.operands[2].value as number),
+					)
+				)
+			);
+		case 'Mul':
+		case 'MulN':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					this.getRegister(ctx, inst.operands[0].value as number),
+					ts.factory.createMultiply(
+						this.getRegister(ctx, inst.operands[1].value as number),
+						this.getRegister(ctx, inst.operands[2].value as number),
+					)
+				)
+			);
+		case 'Div':
+		case 'DivN':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					this.getRegister(ctx, inst.operands[0].value as number),
+					ts.factory.createMultiply(
+						this.getRegister(ctx, inst.operands[1].value as number),
+						this.getRegister(ctx, inst.operands[2].value as number),
+					)
+				)
+			);
+		case 'Mod':
+			return this.assign(ctx, inst,
+				ts.factory.createModulo(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'BitAnd':
+			return this.assign(ctx, inst,
+				ts.factory.createBitwiseAnd(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'BitOr':
+			return this.assign(ctx, inst,
+				ts.factory.createBitwiseOr(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'BitXor':
+			return this.assign(ctx, inst,
+				ts.factory.createBitwiseXor(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'BitNot':
+			return this.assign(ctx, inst,
+				ts.factory.createBitwiseNot(
+					this.getRegister(ctx, inst.operands[1].value as number),
+				)
+			);
+		case 'LShift':
+			return this.assign(ctx, inst,
+				ts.factory.createLeftShift(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'RShift':
+			return this.assign(ctx, inst,
+				ts.factory.createRightShift(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'URshift':
+			return this.assign(ctx, inst,
+				ts.factory.createUnsignedRightShift(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'Negate':
+			return this.assign(ctx, inst,
+				ts.factory.createPrefixMinus(
+					this.getRegister(ctx, inst.operands[1].value as number),
+				)
+			);
+
+		case 'Not':
+			return this.assign(ctx, inst,
+				ts.factory.createLogicalNot(
+					this.getRegister(ctx, inst.operands[1].value as number),
+				)
+			);
+		case 'Eq':
+			return this.assign(ctx, inst,
+				ts.factory.createEquality(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'StrictEq':
+			return this.assign(ctx, inst,
+				ts.factory.createStrictEquality(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'Neq':
+			return this.assign(ctx, inst,
+				ts.factory.createInequality(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'StrictNeq':
+			return this.assign(ctx, inst,
+				ts.factory.createStrictInequality(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'Greater':
+			return this.assign(ctx, inst,
+				ts.factory.createGreaterThan(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'GreaterEq':
+			return this.assign(ctx, inst,
+				ts.factory.createGreaterThan(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'Less':
+			return this.assign(ctx, inst,
+				ts.factory.createLessThan(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+		case 'LessEq':
+			return this.assign(ctx, inst,
+				ts.factory.createLessThanEquals(
+					this.getRegister(ctx, inst.operands[1].value as number),
+					this.getRegister(ctx, inst.operands[2].value as number),
+				)
+			);
+	
+
+
+		case 'LoadParam':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					this.getRegister(ctx, inst.operands[0].value as number),
+					this.getParameter(ctx, inst.operands[1].value as number)
+				)
+			);
+
+		case 'CreateEnvironment': {
+			const origin = ts.factory.createExpressionStatement(ts.factory.createVoidZero());
+			const env: Environment = {
+				parent: ctx.env,
+				vars: [],
+				origin,
+			};
+			ctx.envs.push(env);
+			scope.envRegs[inst.operands[0].value as number] = env;
+			return origin;
 		}
+		case 'GetEnvironment': {
+			let env = ctx.env;
+			for (let i = 0; i < (inst.operands[1].value as number); i++) {
+				env = env.parent;
+			}
+			scope.envRegs[inst.operands[0].value as number] = env;
+			return ts.factory.createEmptyStatement();
+		}
+		case 'StoreToEnvironment':
+		case 'StoreToEnvironmentL':
+		case 'StoreNPToEnvironment':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					this.getEnvironmentVariable(
+						scope,
+						inst.operands[0].value as number,
+						inst.operands[1].value as number
+					),
+					this.getRegister(ctx, inst.operands[2].value as number)
+				)
+			);
+		case 'LoadFromEnvironment':
+		case 'LoadFromEnvironmentL':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					this.getRegister(ctx, inst.operands[0].value as number),
+					this.getEnvironmentVariable(
+						scope,
+						inst.operands[1].value as number,
+						inst.operands[2].value as number
+					)
+				)
+			);
+
+		case 'CreateClosure':
+			return ts.factory.createExpressionStatement(
+				ts.factory.createAssignment(
+					this.getRegister(ctx, inst.operands[0].value as number),
+					this.decompileFunction({
+						params: [],
+						regs: [],
+						env: this.getEnvironment(scope, inst.operands[1].value as number),
+						envs: [],
+						queue: [],
+						completed: new Map(),
+					}, this.header.functionHeaders[inst.operands[2].value as number])
+				)
+			);
+			
+		case 'CreateThis':
+			return ts.addSyntheticTrailingComment(ts.factory.createEmptyStatement(), ts.SyntaxKind.SingleLineCommentTrivia, 'this instruction is followed by mov instructions that pass the arguments for Construct');
+		case 'Construct':
+			return this.assign(ctx, inst,
+				ts.factory.createNewExpression(this.getRegister(ctx, 1), undefined, []) //TODO: arguments
+			);
+
+		//Not implemented 
+		case 'Call':
+			return ts.addSyntheticTrailingComment(
+				ts.factory.createExpressionStatement(
+					ts.factory.createVoidZero()
+				),
+				ts.SyntaxKind.SingleLineCommentTrivia,
+				'TODO: Decompiler: ' + inst.opcode
+			);
+		default:
+			Decompiler.warnings.add(inst.opcode);
+			return ts.factory.createThrowStatement(
+				ts.factory.createNewExpression(
+					ts.factory.createIdentifier('Error'),
+					undefined,
+					[ts.factory.createStringLiteral('Decompiler error: Opcode not implemented: ' + inst.opcode)]
+				)
+			);
+		}
+
+		// return ts.factory.createExpressionStatement(ts.factory.createStringLiteral(inst.opcode));
 	}
 
+
+	private assign(ctx: Context, inst: Instruction, node: ts.Expression) {
+		return ts.factory.createExpressionStatement(
+			ts.factory.createAssignment(
+				this.getRegister(ctx, inst.operands[0].value as number),
+				node
+			)
+		);
+	}
+	
+	private condition(node: ts.Expression) {
+		return ts.factory.createExpressionStatement(
+			ts.factory.createAssignment(
+				ts.factory.createIdentifier('flag'),
+				node
+			)
+		);
+	}
+	private conditionNot(node: ts.Expression) {
+		return ts.factory.createExpressionStatement(
+			ts.factory.createAssignment(
+				ts.factory.createIdentifier('flag'),
+				ts.factory.createLogicalNot(node)
+			)
+		);
+	}
+
+	private getRegister(ctx: Context, register: number) {
+		if (ctx.regs[register]) {
+			return ctx.regs[register];
+		}
+
+		return ctx.regs[register] = ts.factory.createIdentifier('r' + register);
+	}
+
+	private getParameter(ctx: Context, nr: number) {
+		if (nr === 0) {
+			return ts.factory.createThis();
+		}
+
+		return ctx.params[nr - 1];
+	}
+
+	private getEnvironment(scope: Scope, reg: number) {
+		while (scope != scope.parent && !scope.envRegs[reg]) {
+			scope = scope.parent;
+		}
+		return scope.envRegs[reg];
+	}
+
+	private getEnvironmentVariable(scope: Scope, reg: number, nr: number) {
+		const env = this.getEnvironment(scope, reg);
+		if (!env) {
+			return ts.factory.createIdentifier('error_decompiler_no_environment');
+		} 
+
+		if (env.vars[nr]) {
+			return env.vars[nr];
+		}
+
+		return env.vars[nr] = ts.factory.createIdentifier('e' + nr);
+	}
+	
 	private toLiteral(value: unknown): ts.Expression {
 		if (value === null) {
 			return ts.factory.createNull();
@@ -720,319 +1165,72 @@ export class Decompiler {
 		throw new Error('Unknown literal type: ' + typeof value);
 	}
 
-	private toIdentifier(ctx: Context, node: InstructionNode, index: number) {
-		const result = ctx.registers[node.instr.operands[index].value as number];
-		if (result) {
-			return result;
-		}
-
-		return ctx.registers[node.instr.operands[index].value as number]
-			= ts.factory.createUniqueName('r', ts.GeneratedIdentifierFlags.ReservedInNestedScopes);
-	}
-
-	private assign(ctx: Context, node: InstructionNode, index: number, tsNode: ts.Expression) {
-		return ts.factory.createAssignment(this.toIdentifier(ctx, node, index), tsNode as ts.Expression);
-	}
-
-	private createClosure(dummy: ts.Expression, funcId: number, context: Context): ts.Expression {
-		const env = context.environments.get(dummy);
-		if (!env) throw new Error('Unreachable? Could not resolve environment.');
-
-		const func = this.header.functionHeaders[funcId];
-
-		const params: ts.Identifier[] = [];
-		for (let i = 0; i < func.paramCount; i++) {
-			params.push(ts.factory.createUniqueName('p', ts.GeneratedIdentifierFlags.ReservedInNestedScopes)); //ts.GeneratedIdentifierFlags.ReservedInNestedScopes
-		}
-
-		const childContext: Context = {
-			blocksConversion: new Map(),
-			environment: env,
-			environments: new Map(),
-			fixups: new Map(),
-			nodeConversion: new Map(),
-			params: params,
-			registers: [],
-		};
+	// private printCtrlFlow() {
+	// 	let text = '';
 		
-		const body = this.decompileFuction(func, childContext);
-
-		const result = ts.factory.createFunctionExpression(
-			undefined,
-			undefined,
-			this.disasm.getName(func) || undefined,
-			undefined,
-			childContext.params.slice(1).map(
-				i => ts.factory.createParameterDeclaration(
-					undefined, undefined, undefined,
-					i,
-					undefined, undefined, undefined
-				)
-			),
-			undefined,
-			body
-		);
-
-		return result;
-	}
-
-	private nextID = 1;
-	private getEnvVariable(env: Environment, index: number) {
-		if (env.variables[index]) {
-			return env.variables[index];
-		}
+	// 	for (const [i, func] of Object.entries(this.header.functionHeaders)) {
+	// 		if (Number(i) % 1000 === 99) {
+	// 			console.log(`progress: ${i+1}/${header.functionHeaders.length} (${Number(i) / header.functionHeaders.length * 100}%)`);
+	// 		}
 		
-		const ident = ts.factory.createUniqueName('c' + (this.nextID++));
-		env.variables[index] = ident;
-		return ident;
-	}
+	// 		text += `function f${header.functionHeaders.indexOf(func)}() { //${func.offset}\n`;
+		
+	// 		try {
+	// 			// ctrlFlow.buildControlFlow(func);
+	// 			text += ctrlFlow.buildAndPrint(func);
+	// 		} catch (e) {
+	// 			text += (e as any)?.stack;
+	// 		}
+		
+	// 		text += '}\n\n';
+	// 	}
+	// }
+	// private printInstrs() {
+	// 	let result = '';
+	// 	for (const [i, func] of Object.entries(this.header.functionHeaders)) {
+	// 		if (Number(i) % 100 === 99) {
+	// 			console.log(`progress: ${i}/${this.header.functionHeaders.length} (${Number(i) / this.header.functionHeaders.length * 100}%)`);
+	// 		}
 
-	private labels(insts: Instruction[]) {
-		const labels: number[] = [];
-		for (const inst of insts) {
-			for (const operand of inst.operands) {
-				if (operand.type === 'Addr8' || operand.type === 'Addr32') {
-					labels.push(this.asOffset(operand, inst.ip));
-				}
-			}
-		}
+	// 		result += `func ${i} //${func.offset}\n`;
 
-		labels.sort((a, b) => a - b);
-
-		return labels;
-	}
-
-	private blocks(insts: Instruction[], labels: number[]): Record<number, Instruction[]> {
-		const result: Record<number, Instruction[]> = {};
-
-		let block: Instruction[] = [];
-		for (const inst of insts) {
-			if (block.length > 0 && labels.includes(inst.ip)) {
-				result[block[0].ip] = block;
-				block = [];
-			}
-			block.push(inst);
-			if (inst.opcode.startsWith('J')) {
-				result[block[0].ip] = block;
-				block = [];
-			}
-		}
-
-		if (block.length > 0) {
-			result[block[0].ip] = block;
-		}
-
-		const resultLength = Object.values(result).map(b => b.length).reduce((a, b) => a + b, 0);
-		if (insts.length !== resultLength) {
-			throw new Error('Statement count mismatch');
-		}
-
-		return result;
-	}
-
-	private blockFlow(blocks: Record<number, Instruction[]>): Block {
-		const blockMap: Record<number, Block> = {};
-		const ipList = Object.keys(blocks).map(ip => Number(ip)).sort((a, b) => a - b);
-
-		for (const ip of ipList) {
-			const block: Block = {
-				type: BlockType.DEFAULT,
-				insts: blocks[ip],
-				tLabel: {} as Block,
-				fLabel: {} as Block,
-			};
-			block.tLabel = block;
-			block.fLabel = block;
-			blockMap[ip] = block;
-		}
-
-		for (const ip of ipList) {
-			const block = blockMap[ip];
-			block.fLabel = blockMap[ipList.find(l => l > ip) ?? ip];
-			
-			const last = block.insts[block.insts.length - 1];
-			const target = last?.operands.find(op => op.type === 'Addr8' || op.type === 'Addr32');
-			if (target) {
-				const targetIP = this.asOffset(target, last.ip);
-				block.tLabel = blockMap[targetIP];
-			} else {
-				block.tLabel = block.fLabel;
-			}			
-		}
-
-		return blockMap[0];
-	}
+	// 		try {
+	// 			const instrs = this.disassembler.disassemble(func);
+	// 			for (const instr of instrs) {
+	// 				result += `  ${instr.ip}: ${instr.opcode}`;
 	
-	private buildRegisters(ctx: Context, stmts: ts.Statement[]) {
-		if (ctx.registers.length === 0) {
-			return stmts;
-		}
-
-		const decl = ts.factory.createVariableStatement(
-			undefined,
-			ts.factory.createVariableDeclarationList(
-				ctx.registers.filter(i => i && ts.isIdentifier(i)).map(
-					i => ts.factory.createVariableDeclaration(i)
-				),
-				ts.NodeFlags.Let
-			)
-		);
-
-		return [decl, ...stmts];
-	}
-
-	private applyFixups(node: ts.Block, ctx: Context) {
-		const visitedNodes = new Set<ts.Node>();
-		const visitedStmts = new Set<ts.Statement>();
-		const result= ts.transform(node, [(context: ts.TransformationContext) => (node) => 
-			ts.visitNode(node, function visit(node): ts.Node {
-				if (ts.isIdentifier(node)) {
-					return node;
-				}
-				if (visitedNodes.has(node)) {
-					//console.log('loop node detected');
-					return ts.factory.createEmptyStatement();
-				} 
-				
-				visitedNodes.add(node);
-
-				if (ts.isBlock(node)) {
-					//return ts.visitEachChild(node, visit, context);
-					const stmts = Array.from(node.statements);
-					const fixups = stmts.filter(s => ctx.fixups.has(s));
-					if (fixups.length) {
-						for (const fixup of fixups) {
-							const newStmts = ctx.fixups.get(fixup)!();
-							stmts.splice(stmts.indexOf(fixup), 1, ...newStmts);
-						}
-
-						for (let i = 0; i < stmts.length; i++) {
-							if (visitedStmts.has(stmts[i])) {
-								console.log('loop detected');
-								stmts.splice(i, 1);
-								i--;
-							} else {
-								visitedStmts.add(stmts[i]);
-								stmts[i] = ts.visitEachChild(stmts[i], visit, context);
-							}
-						}
-
-						return ts.factory.createBlock(stmts, true);
-					}
-					
-				}
-
-				return ts.visitEachChild(node, visit, context);
-			} as ts.Visitor)
-		]);
-		return result.transformed[0];
-	}
-
-	private combineIfDoWhile<T extends ts.Node>(node: T) {
-		const test= ts.transform(node, [(context: ts.TransformationContext) => (node) => 
-			ts.visitNode(node, function visit(node): ts.Node {
-				if (ts.isIfStatement(node)
-				&& ts.isBlock(node.thenStatement)
-				&& node.thenStatement.statements.length === 1
-				&& ts.isDoStatement(node.thenStatement.statements[0])
-				&& !node.elseStatement
-				&& JSON.stringify(node.expression) === JSON.stringify(node.thenStatement.statements[0].expression)) {
-					return ts.factory.createWhileStatement(node.expression, node.thenStatement.statements[0].statement);
-				}
-				return ts.visitEachChild(node, visit, context);
-			} as ts.Visitor)
-		]);
-		return test.transformed[0];
-	}
-
-	private combindeFor<T extends ts.Node>(node: T) {
-		const test= ts.transform(node, [(context: ts.TransformationContext) => (node) => 
-			ts.visitNode(node, (function visit(this: Decompiler, node): ts.Node {
-				if (ts.isBlock(node)) {
-					const stmt = Array.from(node.statements);
-					for (let i = 1; i < stmt.length; i++) {
-						const current = stmt[i];
-						const last = stmt[i - 1];
+	// 				for (const op of instr.operands) {
+	// 					result += ' ' + op.type + ':' + op.value;
+	// 				}
 	
-						if (ts.isWhileStatement(current)
-						&& ts.isBlock(current.statement)
-						&& ts.isVariableStatement(last)
-						&& last.declarationList.declarations.length === 1
-						&& last.declarationList.declarations[0].initializer
-						&& ts.isNumericLiteral(last.declarationList.declarations[0].initializer)) {
-							const end = current.statement.statements[current.statement.statements.length-1];
-							if (ts.isExpressionStatement(end)
-							&& ts.isBinaryExpression(end.expression)
-							&& end.expression.operatorToken.kind === ts.SyntaxKind.FirstAssignment
-							&& ts.isIdentifier(end.expression.left)
-							&& ts.isBinaryExpression(end.expression.right)
-							&& end.expression.right.operatorToken.kind === ts.SyntaxKind.PlusToken
-							&& ts.isIdentifier(end.expression.right.left)
-							&& end.expression.left === end.expression.right.left
-							&& ts.isNumericLiteral(end.expression.right.right)) {
-
-								const inner = ts.factory.createBlock(current.statement.statements.slice(0, current.statement.statements.length-1), true);
-
-								const increment = end.expression.right.right.text === '1'
-									? ts.factory.createPostfixIncrement(end.expression.left)
-									: end.expression;
-
-								const loop = ts.factory.createForStatement(last.declarationList, current.expression, increment, inner);
-								const renamed = this.rename(loop, end.expression.left, ts.factory.createUniqueName('i', ts.GeneratedIdentifierFlags.Optimistic));
-
-								stmt[i] = renamed;
-								stmt.splice(i-1, 1);
-								i--;
-							}
-						}
-					}
-					node = ts.factory.createBlock(stmt, true);
-				}
-
-				return ts.visitEachChild(node, visit.bind(this), context);
-			} as ts.Visitor).bind(this))
-		]);
-		return test.transformed[0];
-	}
-
-	private rename<T extends ts.Node>(node: T, oldName: ts.Identifier, newName: ts.Identifier) {
-		const test= ts.transform(node, [(context: ts.TransformationContext) => (node) => 
-			ts.visitNode(node, function visit(node): ts.Node {
-				if (node === oldName) {
-					return newName;
-				}
-
-				return ts.visitEachChild(node, visit, context);
-			} as ts.Visitor)
-		]);
-		return test.transformed[0];
-	}
-
-	private createSourcefile(filename: string, ast: ts.Node[], languageVersion: ts.ScriptTarget): ts.SourceFile {
-		const dummy = ts.createSourceFile(filename, 'dummy', languageVersion); // need at least 1 node
+	// 				result += '\n';
+	// 			}
+	// 		} catch (e) {
+	// 			result += e + '\n';
+	// 		}
 	
-		return ts.transform(
-			dummy,
-			[ transformContext => sourceFile => ts.visitEachChild(sourceFile, () => ast, transformContext) ]
-		).transformed[0];
-	}
+	// 		result += '\n';
+	// 	}
 
-	private debug(stmt: ts.Statement) {
-		const src = ts.createSourceFile('x.ts', '', ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
+	// 	return result;
+	// }
+	// 	private printInstrs(header: FunctionHeader) {
+	// 		let result = '';
+	// 		try {
+	// 			const instrs = this.disassembler.disassemble(header);
+	// 			for (const instr of instrs) {
+	// 				result += `  ${instr.ip}: ${instr.opcode}`;
+	
+	// 				for (const op of instr.operands) {
+	// 					result += ' ' + op.type + ':' + op.value;
+	// 				}
+	
+	// 				result += '\n';
+	// 			}
+	// 		} catch (e) {
+	// 			result += e + '\n';
+	// 		}
 
-		ts.factory.updateSourceFile(src, [stmt]);
-		
-		const printer = ts.createPrinter();
-		const result = printer.printNode(ts.EmitHint.Unspecified, stmt, src);
-		console.log(result);
-	}
-	private debugBlock(stmts: ts.Block) {
-		const src = ts.createSourceFile('x.ts', '', ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
-
-		ts.factory.updateSourceFile(src, stmts.statements);
-		
-		const printer = ts.createPrinter();
-		const result = printer.printNode(ts.EmitHint.Unspecified, stmts, src);
-		console.log(result);
-	}
+	// 		return result;
+	// 	}
 }

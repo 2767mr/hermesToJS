@@ -21,7 +21,7 @@ export class SerializedLiteralParser {
 
 		let offset = 0;
 
-		while (offset < buffer.length) {
+		while (offset < buffer.length /*&& offset < 10000*/) {
 			const tag = buffer[offset++];
 			const hasExtendedTag = (tag & 0x80) === 0x80;
 			const extendedTag = hasExtendedTag ? buffer[offset++] : 0;
