@@ -1,6 +1,5 @@
 import structure from './assets/structure.json';
 import { Reader } from './reader';
-import { SerializedLiteralParser } from './slp';
 
 
 export type Header = {
@@ -56,9 +55,9 @@ export interface HBCHeader {
     instOffset: number;
     inst: ArrayBufferLike;
 
-	arrayValues: unknown[];
-	objKeyValues: unknown[];
-	objValueValues: unknown[];
+	arrayValuesRaw: DataView;
+	objKeyValuesRaw: DataView;
+	objValueValuesRaw: DataView;
 }
 
 export class Parser {
@@ -187,25 +186,25 @@ export class Parser {
 			stringTableOverflowEntries,
 			instOffset: this.reader.tell(),
 			inst: this.reader.readAll(),
-			arrayValues: [],
-			objKeyValues: [],
-			objValueValues: []
+			arrayValuesRaw: new DataView(new Uint8Array(arrayBuffer).buffer),
+			objKeyValuesRaw: new DataView(new Uint8Array(objKeyBuffer).buffer),
+			objValueValuesRaw: new DataView(new Uint8Array(objValueBuffer).buffer)
 		};
 
-		console.log('started slp');
+		// console.log('started slp');
 
 		// Object.assign(result, JSON.parse(require('fs').readFileSync('slp.json', 'utf8')));
 
-		result.arrayValues = SerializedLiteralParser.parse(new Uint8Array(arrayBuffer), result);
-		result.objKeyValues = SerializedLiteralParser.parse(new Uint8Array(objKeyBuffer), result);
-		result.objValueValues = SerializedLiteralParser.parse(new Uint8Array(objValueBuffer), result);
+		// result.arrayValues = SerializedLiteralParser.parse(array, result);
+		// result.objKeyValues = SerializedLiteralParser.parse(new Uint8Array(objKeyBuffer), result);
+		// result.objValueValues = SerializedLiteralParser.parse(new Uint8Array(objValueBuffer), result);
 
-		// fs.writeFileSync('slp.json', JSON.stringify({
+		// require('fs').writeFileSync('slp.json', JSON.stringify({
 		// 	arrayValues: result.arrayValues,
 		// 	objKeyValues: result.objKeyValues,
 		// 	objValueValues: result.objValueValues,
 		// }));
-		console.log('parsed slp');
+		// console.log('parsed slp');
 
 		return result;
 	}

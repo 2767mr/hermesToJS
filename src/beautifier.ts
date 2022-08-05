@@ -22,7 +22,7 @@ export class Beautifier {
 			this.removeDoubleNot,
 			this.removeDoubleParens,
 			this.removeEmptyStatements,
-			this.inlineLiterals,
+			//this.inlineLiterals,
 			this.removeGlobalThis,
 			this.improveRegisterNames,
 		]);

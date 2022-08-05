@@ -19,7 +19,7 @@ export class Disassembler {
 
 	private static readonly decoder = new TextDecoder();
 
-	private readonly operandType: Record<string, [number, (bytes: ArrayBuffer) => number]> = {
+	private readonly operandType: Record<string, [number, (bytes: DataView, offset: number) => number]> = {
 		'Reg8': [1, this.toUInt8],
 		'Reg32': [4, this.toUInt32],
 		'UInt8': [1, this.toUInt8],
@@ -48,7 +48,7 @@ export class Disassembler {
 		for (let i = 0; i < bc.byteLength;) {
 			const ip = i;
 
-			const opcode = this.opCodes[this.toUInt8(bc.slice(ip))];
+			const opcode = this.opCodes[this.toUInt8(bc, ip)];
 			const ops = rawOpCodes[opcode];
 			i++;
 			
@@ -59,7 +59,7 @@ export class Disassembler {
 				const type = !isStr ? operand : operand.substring(0, operand.length - 2);
 					
 				const [size, conv_to] = this.operandType[type];
-				const value = conv_to(bc.slice(i, i+size));
+				const value = conv_to(bc, i);
 				i+=size;
 
 				if (isStr) {
@@ -82,7 +82,7 @@ export class Disassembler {
 				const values = new Array<number>(count);
 
 				for (let i = 0; i < count; i++) {
-					values[i] = this.toInt32(all.slice(start + i * 4, start + (i + 1) * 4));
+					values[i] = this.toInt32(all, start + i * 4);
 				}
 					
 				operands[1].value = values;
@@ -130,36 +130,34 @@ export class Disassembler {
 
 	private getByteCode(func: FunctionHeader) {
 		const start = func.offset - this.header.instOffset;
-		const end = start + func.bytecodeSizeInBytes;
-
-		return this.header.inst.slice(start, end);
+		return new DataView(this.header.inst, start, func.bytecodeSizeInBytes);
 	}
 
 	private getAllByteCode(func: FunctionHeader) {
 		const start = func.offset - this.header.instOffset;
-		return this.header.inst.slice(start);
+		return new DataView(this.header.inst, start);
 	}
 
-	private toUInt8(bytes: ArrayBufferLike) {
-		return new Uint8Array(bytes)[0];
+	private toUInt8(bytes: DataView, offset: number) {
+		return bytes.getUint8(offset);
 	}
-	private toUInt16(bytes: ArrayBufferLike) {
-		return new Uint16Array(bytes)[0];
-	}
-
-	private toUInt32(bytes: ArrayBufferLike) {
-		return new Uint32Array(bytes)[0];
+	private toUInt16(bytes: DataView, offset: number) {
+		return bytes.getUint16(offset, true);
 	}
 
-	private toInt8(bytes: ArrayBufferLike) {
-		return new Int8Array(bytes)[0];
-	}
-	private toInt32(bytes: ArrayBufferLike) {
-		return new Int32Array(bytes)[0];
+	private toUInt32(bytes: DataView, offset: number) {
+		return bytes.getUint32(offset, true);
 	}
 
-	private toDouble(bytes: ArrayBufferLike) {
-		return new Float64Array(bytes)[0];
+	private toInt8(bytes: DataView, offset: number) {
+		return bytes.getInt8(offset);
+	}
+	private toInt32(bytes: DataView, offset: number) {
+		return bytes.getInt32(offset, true);
+	}
+
+	private toDouble(bytes: DataView, offset: number) {
+		return bytes.getFloat64(offset, true);
 	}
 
 	private align(value: number, align: number) {

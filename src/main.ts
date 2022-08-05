@@ -7,8 +7,8 @@ import { Parser } from './parser';
 import { Printer } from './printer';
 
 
-const data = fs.readFileSync('../data/test.bundle');
-// const data = fs.readFileSync('../index.android.bundle');
+// const data = fs.readFileSync('../data/objects.bundle');
+const data = fs.readFileSync('../index.android_old.bundle');
 const parser = new Parser(data);
 const header = parser.parse();
 
@@ -23,4 +23,4 @@ console.log('beautifying');
 const result = beauty.beautify(decompiled);
 
 console.log('printing');
-new Printer().print(result, 'result2.js');
+new Printer().print(result, 'result.js');

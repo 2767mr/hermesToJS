@@ -3,6 +3,7 @@ import ts from 'typescript';
 import { CodeBlock, ControlflowBuilder, ControlflowNode } from './controlflow';
 import { Disassembler, Instruction } from './disasm';
 import { FunctionHeader, HBCHeader } from './parser';
+import { SerializedLiteralParser } from './slp';
 
 interface Environment {
 	parent: Environment;
@@ -134,7 +135,7 @@ export class Decompiler {
 					} as ts.Visitor).bind(this))
 		]).transformed[0] as ts.FunctionExpression;
 
-		ts.addSyntheticLeadingComment(result, ts.SyntaxKind.MultiLineCommentTrivia, 'function ' + this.header.functionHeaders.indexOf(fHeader));
+		// ts.addSyntheticLeadingComment(result, ts.SyntaxKind.MultiLineCommentTrivia, 'function ' + this.header.functionHeaders.indexOf(fHeader));
 		
 		// this.printTSNode(ts.factory.createExpressionStatement(result));
 		return result;
@@ -621,20 +622,11 @@ export class Decompiler {
 			const keyIndex = inst.operands[3].value as number;
 			const valueIndex = inst.operands[4].value as number;
 	
-			const properties: ts.ObjectLiteralElementLike[] = [];
-			for (let i = 0; i < staticElements; i++) {
-				if (this.header.objValueValues[valueIndex + i] === undefined) {
-					return ts.factory.createThrowStatement(
-						ts.factory.createNewExpression(
-							ts.factory.createIdentifier('Error'),
-							undefined,
-							[ts.factory.createStringLiteral('Decompiler error: NewObjectWithBufferLong overflow')]
-						)
-					);
-				}
-				properties.push(ts.factory.createPropertyAssignment('' + this.header.objKeyValues[keyIndex + i], 
-					this.toLiteral(this.header.objValueValues[valueIndex + i])));
-			}
+			const keys = SerializedLiteralParser.parseN(this.header.objKeyValuesRaw, this.header, keyIndex, staticElements);
+			const values = SerializedLiteralParser.parseN(this.header.objValueValuesRaw, this.header, valueIndex, staticElements);
+			const properties: ts.ObjectLiteralElementLike[] =
+				keys.map((key, index) => ts.factory.createPropertyAssignment('' + key, this.toLiteral(values[index])));
+			
 
 			return this.assign(ctx, inst, 
 				ts.factory.createObjectLiteralExpression(properties, staticElements > 1)
@@ -646,19 +638,9 @@ export class Decompiler {
 			const staticElements = inst.operands[2].value as number;
 			const index = inst.operands[3].value as number;
 	
-			const elements: ts.Expression[] = [];
-			for (let i = 0; i < staticElements; i++) {
-				if (this.header.arrayValues[index + i] === undefined) {
-					return ts.factory.createThrowStatement(
-						ts.factory.createNewExpression(
-							ts.factory.createIdentifier('Error'),
-							undefined,
-							[ts.factory.createStringLiteral('Decompiler error: NewArrayWithBufferLong overflow')]
-						)
-					);
-				}
-				elements.push(this.toLiteral(this.header.arrayValues[index + i]));
-			}
+			const elements: ts.Expression[] = 
+				SerializedLiteralParser.parseN(this.header.arrayValuesRaw, this.header, index, staticElements)
+					.map(value => this.toLiteral(value));
 	
 			return this.assign(ctx, inst, 
 				ts.factory.createArrayLiteralExpression(elements)
