@@ -13,6 +13,7 @@ export class Beautifier {
 	};
 
 	private niceNames = new Map<string, ts.Identifier>();
+	private niceEnvNames = new Map<string, ts.Identifier>();
 
 	public beautify(stmt: ts.Statement) {
 		return this.transform(stmt, [
@@ -259,18 +260,33 @@ export class Beautifier {
 			return this.niceNames.get(node.text)!;
 		}
 
+		if (ts.isIdentifier(node)
+		&& this.niceEnvNames.has(node.text)) {
+			return this.niceEnvNames.get(node.text)!;
+		}
+
+
 		if (ts.isVariableDeclaration(node)
 		&& ts.isIdentifier(node.name)
-		&& (node.name.text.startsWith('__reg__') 
-			|| node.name.text.startsWith('__envreg__'))) {
+		&& node.name.text.startsWith('__reg__')) {
 			const name = node.name.text;
 			const number = Number(name.substring(name.lastIndexOf('__') + 2));
 			if (!Number.isNaN(number)) {
-				const newName = name.startsWith('__e')
-					? (NICE_NAMES[number] ?? ('e' + number)) + '_'
-					: (NICE_NAMES[number] ?? ('r' + number));
+				const newName = NICE_NAMES[number] ?? ('r' + number);
 				const newNode = ts.factory.createIdentifier(newName); //ts.factory.createUniqueName(newName, ts.GeneratedIdentifierFlags.Optimistic);
 				this.niceNames.set(name, newNode);
+				return ts.factory.updateVariableDeclaration(node, newNode, node.exclamationToken, node.type, node.initializer);
+			}
+			return node;
+		} else if (ts.isVariableDeclaration(node)
+		&& ts.isIdentifier(node.name)
+		&& node.name.text.startsWith('__envreg__')) {
+			const name = node.name.text;
+			const number = Number(name.substring(name.lastIndexOf('__') + 2));
+			if (!Number.isNaN(number)) {
+				const newName = (NICE_NAMES[number] ?? ('e' + number)) + '_';
+				const newNode = ts.factory.createIdentifier(newName); //ts.factory.createUniqueName(newName, ts.GeneratedIdentifierFlags.Optimistic);
+				this.niceEnvNames.set(name, newNode);
 				return ts.factory.updateVariableDeclaration(node, newNode, node.exclamationToken, node.type, node.initializer);
 			}
 			return node;
